@@ -1,0 +1,7 @@
+interface:
+  display_name: "Video Maker"
+  short_description: "B站视频制作主 skill，优先本地 Qwen，保留 ElevenLabs 与 Edge 兜底"
+  default_prompt: "Use $video-maker to scaffold or upgrade a B站 video project with local Qwen-first TTS, local rendering, publish metadata generation, and upload handoff."
+
+policy:
+  allow_implicit_invocation: true

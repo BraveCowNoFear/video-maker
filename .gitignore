@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+Thumbs.db
+
+tmp/
+output/
+audio/
+clips/
+slide_png/
+publish/
