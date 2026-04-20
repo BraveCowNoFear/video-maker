@@ -5,7 +5,9 @@ description: End-to-end B 站视频制作主 skill。用于起项目、生成讲
 
 # Video Maker
 
-这是新的主入口。旧的 `bilibili-video-factory` 和 `bilibili-natural-voice-factory` 继续保留做兼容，但默认优先用 `video-maker`。
+这是当前唯一主入口。历史旧入口已经迁移并删除，默认只使用 `video-maker`。
+
+如果任务包含真实 B 站上传、Edge 页面操作、桌面点击、拖拽或其他可见 UI 控制，同时也要用 `desktop-control-for-windows`。
 
 ## Use This Skill For
 
@@ -68,6 +70,15 @@ description: End-to-end B 站视频制作主 skill。用于起项目、生成讲
   -Root "C:\Users\Clr\Documents\Playground\output\my-video-maker-project"
 ```
 
+首次上机或换机器时，先读 [environment-setup.md](references/environment-setup.md)。
+
+环境检查：
+
+```powershell
+& "C:\Users\Clr\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" `
+  "C:\Users\Clr\.agents\skills\video-maker\scripts\doctor.py"
+```
+
 ## Voice Strategy
 
 默认优先级：
@@ -110,6 +121,13 @@ description: End-to-end B 站视频制作主 skill。用于起项目、生成讲
 - 默认让 `desktop-control-for-windows` 的专用 UI worker 读取这份 JSON
 - 用用户当前已登录的 Edge 会话上传
 - 只有在本地 QA 通过、视频文件存在、发布元数据已准备好之后，才进入上传阶段
+
+## Dependency Rules
+
+- 只做脚手架、讲稿、配音、装配、QA：用 `video-maker`
+- 进入真实桌面或真实网页上传：同时用 `desktop-control-for-windows`
+- 如果 `desktop-control-for-windows` 缺失，不要声称“已具备全自动发布”；应明确说明目前只具备本地出片能力
+- 如果换了一台机器，先运行 `scripts/doctor.py`，再决定是否能直接走 `local-qwen` 或 B 站自动上传
 
 ## Working Rules
 
