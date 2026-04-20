@@ -5,6 +5,18 @@ import json
 from pathlib import Path
 from textwrap import dedent
 
+TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "references" / "quiet-glass-lab"
+TEMPLATE_FILES = [
+    "01-hook.html",
+    "02-problem.html",
+    "03-capabilities.html",
+    "04-flow.html",
+    "05-pros-cons.html",
+    "06-demo.html",
+    "07-open-source.html",
+    "08-choice.html",
+]
+
 
 BASE_CSS = dedent(
     """
@@ -599,16 +611,81 @@ def render_template(content: str, mapping: dict[str, str]) -> str:
     return content
 
 
+def read_template_asset(name: str, fallback: str = "") -> str:
+    path = TEMPLATE_DIR / name
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    if fallback:
+        return fallback
+    raise FileNotFoundError(f"Missing required quiet-glass template: {path}")
+
+
+def load_slide_templates() -> dict[str, str]:
+    templates: dict[str, str] = {}
+    for name in TEMPLATE_FILES:
+        templates[name] = read_template_asset(name, SLIDES.get(name, ""))
+    return templates
+
+
 def build_project_json(topic: str, slug: str) -> str:
     data = {
         "topic": topic,
         "slug": slug,
         "output_name": f"{slug}.mp4",
-        "audience": "B站上的 Codex / OpenClaw / agent / automation 爱好者",
-        "visual_style": "ios18-glass-minimal",
-        "tone_rules": ["少官话", "句子短", "缺点直说", "画面字少", "先能不能用，再讲设计"],
-        "voice_provider": "preview-edge-tts",
-        "voice_quality_bar": "publish_requires_natural_humanlike_speech",
+        "audience": "想快速听懂概念、术语和实际取舍的 B站技术观众",
+        "visual_style": "bilibili-quiet-glass-lab-v3",
+        "tone_rules": ["少官话", "句子短", "别把概念讲玄", "画面字少", "先讲直觉，再补术语", "每段都要给一句能带走的判断"],
+        "content_strategy": {
+            "series_goal": "把 AI / 技术概念讲成观众能直接带走的判断方法",
+            "episode_goal": "先拆误解，再给地图，最后给场景化选择",
+            "higher_order_takeaway": "不要只解释术语，还要解释这个概念为什么在今天重要，以及它改变了什么判断顺序",
+            "main_agent_role": "chief-editor",
+            "subagents": [
+                "research-scout",
+                "skeptic-elevator",
+                "visual-architect",
+                "voice-director",
+                "acceptance-reviewer",
+            ],
+        },
+        "ui_system": {
+            "theme": "quiet-glass-lab-v3",
+            "glass_look": "tinted",
+            "content_layers": ["content-base", "glass-function-layer", "temporary-explainer-layer"],
+            "rules": [
+                "功能层用玻璃，内容层少用玻璃",
+                "每页只保留一个视觉中心",
+                "不要假状态栏",
+                "glass 要为内容退后，不要抢戏",
+            ],
+        },
+        "voice_provider": "auto-natural-tts",
+        "voice_quality_bar": "publish_requires_reviewed_natural_voice_for_chinese",
+        "voice_persona": {
+            "id": "cn_female_steady_graceful_cute_v1",
+            "display_name": "沉稳大方可爱女声",
+            "identity": "熟悉 AI 和工具工作流、表达克制但友好的年轻中文女生",
+            "core_traits": ["沉稳", "大方", "亲和", "轻微可爱"],
+            "forbidden_traits": ["幼态", "撒娇", "夹子音", "播音腔", "突然兴奋"],
+            "baseline_emotion": "calm_friendly",
+            "pace": "medium_steady",
+            "breath": "light_short_controlled",
+            "emphasis": "light_keyword_only",
+        },
+        "voice_consistency": {
+            "anchor_segment_id": "01",
+            "locked_fields": ["profile", "speaker", "language", "voice_id", "model_id", "base_instruct"],
+            "emotion_variance": "low",
+            "pace_variance": "low",
+            "breath_variance": "low",
+            "regen_policy": "regen_outliers_only",
+        },
+        "acceptance": {
+            "reviewer": "acceptance-reviewer",
+            "must_pass": ["content_depth", "ui_supports_content", "voice_consistency"],
+            "fail_action": "route_back_to_owner_and_regen",
+            "write_back": "summarize_reusable_findings_into_skill",
+        },
     }
     return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
@@ -619,50 +696,49 @@ def build_segments_json(topic: str) -> str:
             "id": "01",
             "type": "slide",
             "html": "slides/01-hook.html",
-            "voice": f"这期聊 {topic}。先看它能做什么，再看它为什么有用，最后直接看 demo。",
+            "voice": f"这期聊 {topic}。先把问题摆出来，再把术语分家，最后给一个能直接落地的选择建议。",
         },
         {
             "id": "02",
             "type": "slide",
             "html": "slides/02-problem.html",
-            "voice": "很多任务不是模型不会想，而是最后一步没有 API、没有 DOM，也没有靠谱 CLI。",
+            "voice": f"第二段先不堆黑话，先讲 {topic} 到底是什么，它解决的是哪一层问题。",
         },
         {
             "id": "03",
             "type": "slide",
             "html": "slides/03-capabilities.html",
-            "voice": "它的核心很直接，会看屏幕，会点，会输，会切窗口，还会回头验结果。",
+            "voice": "再讲它为什么重要，通常先看资源约束、收益来源和真正的代价分别是什么。",
         },
         {
             "id": "04",
             "type": "slide",
             "html": "slides/04-flow.html",
-            "voice": "真正值钱的不是命令数量，而是 coordinator、UI worker、lock、overlay 这一整套受控执行结构。",
+            "voice": "第四段把常见术语放进同一张地图，先分家，再比较，避免观众把不同层的概念混在一起。",
         },
         {
             "id": "05",
             "type": "slide",
             "html": "slides/05-pros-cons.html",
-            "voice": "优点是闭环和稳，缺点也很明显，真实 UI 天生比 API 慢，高思考 UI worker 更稳，但也更慢。",
+            "voice": "然后挑一个最容易被讲错的关键词拆开讲，让观众知道名字和实际实现不一定是一回事。",
         },
         {
             "id": "06",
             "type": "slide",
             "html": "slides/06-demo.html",
-            "voice": "下面不空谈，直接看一次从进入受控态到结果验证的完整 demo。",
+            "voice": "第六段再放一个最容易混淆的对照项，告诉观众这两个东西为什么经常看起来像同类，其实不一定在同一层比较。",
         },
         {
             "id": "07",
-            "type": "demo",
-            "video": "demo/demo.mp4",
-            "placeholder_html": "slides/06-demo.html",
-            "voice": "这里替换成你的实机旁白。把关键动作、验证点和结束态讲清楚。",
+            "type": "slide",
+            "html": "slides/07-open-source.html",
+            "voice": "倒数第二段把体积、速度、质量这种权衡放到一起讲清楚，不给观众绝对化结论。",
         },
         {
             "id": "08",
             "type": "slide",
-            "html": "slides/07-open-source.html",
-            "voice": "最后把开源情况讲清楚，来源、仓库、许可证和最新状态分开核实，别混着讲。",
+            "html": "slides/08-choice.html",
+            "voice": "最后收在一个场景化建议上，告诉观众先看什么，再看什么，把抽象概念落回具体选择。",
         },
     ]
     return json.dumps(segments, ensure_ascii=False, indent=2) + "\n"
@@ -673,38 +749,40 @@ def build_publish_notes(topic: str) -> str:
         f"""
         # 标题候选
 
-        1. {topic} 到底值不值得上手？
-        2. 不靠 API，也能把事做完？{topic} 实机讲解
-        3. {topic}：能力、架构、缺点、demo 一次讲清
+        1. {topic} 入门：把术语和选型一次讲清
+        2. {topic} 到底在解决什么问题？4-5 分钟讲明白
+        3. {topic}：定义、术语、权衡、选择建议一次讲清
 
         # 建议标题
 
-        {topic}：能力、架构、缺点、demo 一次讲清
+        {topic}：定义、术语、权衡、选择建议一次讲清
 
         # 简介
 
         这期视频会讲：
 
-        - 它到底能做什么
-        - 它补的是哪一层
-        - 它为什么不是普通自动化脚本
-        - 它的缺点是什么
-        - 一段端到端实机 demo
+        - 它到底是什么
+        - 它为什么值得讲
+        - 最容易混淆的几个术语怎么分家
+        - 真正的取舍到底是什么
+        - 最后应该怎么选
 
         # 标签建议
 
-        - codex
-        - openclaw
-        - ai agent
-        - 自动化
-        - windows
-        - 开源项目
+        - 大模型
+        - AI科普
+        - 本地部署
+        - 模型推理
+        - 技术解释
 
         # 备注
 
-        - 风格统一：iOS 18 毛玻璃极简风
+        - 风格统一：Quiet Glass Lab v3，参考 iOS / iPadOS Liquid Glass 的功能层逻辑，不要机械复刻苹果截图
         - 画面字少于旁白
+        - 单页只保留一个视觉中心
+        - 概念型科普可以没有 demo 段，工具实操类视频再补录屏
         - 如果配音仍是 preview-edge-tts，不要直接发
+        - 出片前必须过 acceptance-reviewer：内容深度、UI 服务内容、配音一致性三项都要过
         """
     ).lstrip()
 
@@ -720,11 +798,13 @@ def main() -> None:
     for rel in ["content", "slides", "scripts", "audio", "clips", "slide_png", "demo"]:
         (root / rel).mkdir(parents=True, exist_ok=True)
 
+    slide_templates = load_slide_templates()
+
     write_text(root / "content" / "project.json", build_project_json(args.topic, args.slug))
     write_text(root / "content" / "segments.json", build_segments_json(args.topic))
     write_text(root / "publish_notes.md", build_publish_notes(args.topic))
-    write_text(root / "slides" / "base.css", BASE_CSS)
-    for name, content in SLIDES.items():
+    write_text(root / "slides" / "base.css", read_template_asset("base.css", BASE_CSS))
+    for name, content in slide_templates.items():
         write_text(root / "slides" / name, render_template(content, mapping))
 
     write_text(root / "scripts" / "generate_tts_edge.py", GENERATE_TTS_EDGE)

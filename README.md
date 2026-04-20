@@ -12,6 +12,8 @@ It is built around one practical goal:
 - assemble a final MP4 locally
 - prepare structured publish metadata for a Bilibili upload worker
 
+The default visual system for new explainers is now `Quiet Glass Lab v3`: a black-carbon, acid-green Liquid Glass layout inspired by iOS 26 / iPadOS 26 and tuned for 3-5 minute Chinese Bilibili tech explainers.
+
 ## What is in this repo
 
 - `SKILL.md`: the skill entrypoint and operator guide
@@ -19,6 +21,11 @@ It is built around one practical goal:
 - `scripts/bootstrap_video_project.py`: base Bilibili video scaffold generator
 - `scripts/upgrade_project.py`: local-Qwen-first upgrade path plus publish helpers
 - `references/`: voice, workflow, and provider notes
+- `references/agent-orchestration.md`: recommended main-agent / sub-agent content pipeline
+- `references/video-acceptance-rubric.md`: dedicated reviewer-agent gate before final render or publish
+- `references/quiet-glass-lab-v3.md`: content-first Liquid Glass rules and design tokens
+- `references/quiet-glass-lab/`: default reusable HTML/CSS slide templates for the black-green Liquid Glass variant
+- `references/bilibili-tech-explainer-workflow.md`: the default 8-segment explainer workflow
 - `agents/openai.yaml`: launcher metadata
 - `scripts/doctor.py`: environment and dependency checker
 
@@ -110,6 +117,7 @@ Those stay on the local machine or inside each generated video project.
 ## Default voice path
 
 For Chinese narration, auto mode now prefers local Qwen when `voice_settings.local_qwen` is ready.
+The generated local-Qwen path does not only reuse `voice_settings.local_qwen`; it also compiles `voice_persona` and `voice_consistency` into an explicit per-run voice lock so the helper receives the same speaker, same pacing baseline, and the same acceptance constraint on every segment.
 
 Provider order:
 
@@ -117,6 +125,31 @@ Provider order:
 2. reviewed `elevenlabs-api`
 3. explicit reviewed `elevenlabs-web`
 4. `edge-preview`
+
+## Content system
+
+The current recommended production split is:
+
+1. main agent as `chief-editor`
+2. sidecar subagents for research, skepticism, UI direction, and voice consistency
+3. main agent merges those results back into one concise thesis, one segment map, and one publishable point of view
+
+The key rule is: a video should not stop at "what this term means." Each episode should also answer why the idea matters now, what confusion it clears up, and what judgment the viewer can carry away after the video ends.
+
+See [references/agent-orchestration.md](C:\Users\Clr\Desktop\github\video-maker\references\agent-orchestration.md) and [references/bilibili-tech-explainer-workflow.md](C:\Users\Clr\Desktop\github\video-maker\references\bilibili-tech-explainer-workflow.md).
+
+## Acceptance
+
+A final video is not considered ready just because it rendered.
+
+Recommended gate:
+
+1. `content_depth`
+2. `ui_supports_content`
+3. `voice_consistency`
+
+Use a dedicated acceptance reviewer agent to decide pass / revise / hard fail, and route issues back to the relevant owner instead of patching them ad hoc.
+If the project only stores voice-consistency metadata but the execution path does not inject that lock into the TTS helper, treat `voice_consistency` as a fail.
 
 ## Publish handoff
 
@@ -137,6 +170,7 @@ The intended upload pairing is:
 - If the task is local project creation, narration, QA, or video assembly, use `video-maker`
 - If the task crosses into visible Windows UI control, also use `desktop-control-for-windows`
 - For first-run setup or debugging on a new machine, run `scripts/doctor.py` before attempting a full publish pipeline
+- For future Bilibili tech explainers, prefer the default `Quiet Glass Lab v3` templates first and only diverge when the topic truly needs a different visual language
 
 ## License
 

@@ -8,11 +8,17 @@ from textwrap import dedent
 
 OLD_DEFAULT_ELEVENLABS_VOICE_ID = "XB0fDUnXU5powFXDhCwa"
 LOCAL_QWEN_BASE_INSTRUCT = (
-    "请用年轻的中文女声做科技讲解。整体气质沉稳、清晰、克制、友好。"
+    "请用年轻的中文女声做科技讲解。整体气质沉稳、大方、清晰、友好，带一点自然可爱的亲和感。"
     "全程保持同一个人设、同一种情绪基线和同一套说话习惯。"
     "语速保持中速偏稳，不忽快忽慢，不忽然兴奋，也不要突然压低情绪。"
-    "句间停顿自然，重点词只做轻微强调，不要夸张，不要急躁，不要播音腔。"
-    "像二十五岁左右、表达很稳的女生，在冷静地讲解工具、工作流和实践经验。"
+    "句间停顿自然，呼吸轻、短、克制，重点词只做轻微强调，不要夸张，不要急躁，不要播音腔。"
+    "不要幼态，不要撒娇，不要夹子音。像二十五岁左右、表达很稳的女生，在冷静而友好地讲解工具、工作流和 AI 概念。"
+)
+
+DEFAULT_PROJECT_QWEN_INSTRUCT = (
+    "请继续沿用完全相同的人设、音色、情绪基线、语速和呼吸风格完成整条视频。"
+    "沉稳、大方、亲和，带一点自然可爱感，但不要幼态，不要撒娇，不要夹子音。"
+    "中速偏稳，轻呼吸，轻强调，不要播音腔，不要突然兴奋。"
 )
 
 
@@ -108,6 +114,89 @@ GENERATE_TTS_PUBLISH = dedent(
         return settings.get("local_qwen", {}) or {}
 
 
+    def choose_list(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        items: list[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                items.append(text)
+        return items
+
+
+    def join_instruction_parts(*parts: str) -> str:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            text = str(part or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            cleaned.append(text)
+        return " ".join(cleaned)
+
+
+    def build_local_qwen_args(project: dict) -> list[str]:
+        local_qwen = local_qwen_config(project)
+        voice_persona = project.get("voice_persona", {}) or {}
+        voice_consistency = project.get("voice_consistency", {}) or {}
+        acceptance = project.get("acceptance", {}) or {}
+
+        cmd_args: list[str] = []
+        for flag, key in (
+            ("--profile", "profile"),
+            ("--speaker", "speaker"),
+            ("--language", "language"),
+            ("--format", "format"),
+            ("--attn-implementation", "attn_implementation"),
+            ("--dtype", "dtype"),
+        ):
+            value = str(local_qwen.get(key) or "").strip()
+            if value:
+                cmd_args.extend([flag, value])
+
+        identity = str(voice_persona.get("identity") or "").strip()
+        core_traits = "、".join(choose_list(voice_persona.get("core_traits")))
+        forbidden_traits = "、".join(choose_list(voice_persona.get("forbidden_traits")))
+        locked_fields = "、".join(choose_list(voice_consistency.get("locked_fields")))
+        anchor_segment = str(voice_consistency.get("anchor_segment_id") or "01").strip()
+        baseline_emotion = str(voice_persona.get("baseline_emotion") or "").strip()
+        pace = str(voice_persona.get("pace") or "").strip()
+        breath = str(voice_persona.get("breath") or "").strip()
+        emphasis = str(voice_persona.get("emphasis") or "").strip()
+        reviewer = str(acceptance.get("reviewer") or "").strip()
+
+        instruct = join_instruction_parts(
+            (
+                f"全程保持同一个中文女声人设：{identity}。"
+                if identity
+                else "全程保持同一个中文女声人设。"
+            ),
+            f"核心气质固定为：{core_traits}。" if core_traits else "",
+            f"禁止出现这些倾向：{forbidden_traits}。" if forbidden_traits else "",
+            (
+                f"情绪基线保持 {baseline_emotion}，语速保持 {pace}，呼吸保持 {breath}，重音规则保持 {emphasis}。"
+                if any([baseline_emotion, pace, breath, emphasis])
+                else ""
+            ),
+            (
+                f"整条视频都要延续锚点片段 {anchor_segment} 的同一位说话人、同一音色、同一情绪基线和同一说话习惯。"
+            ),
+            f"锁定字段：{locked_fields}。" if locked_fields else "",
+            "不要在不同分段之间突然变成熟、变稚嫩、变兴奋、变播音腔，或者像换了另一个人。",
+            "即使切到总结、强调或转场，也只允许轻微关键词强调，不要改变整体音色、人设和说话节奏。",
+            (
+                f"这条视频最终需要通过 {reviewer} 的 voice_consistency 验收，不一致就视为失败。"
+                if reviewer
+                else "这条视频最终需要通过 voice_consistency 验收，不一致就视为失败。"
+            ),
+        )
+        if instruct:
+            cmd_args.extend(["--instruct", instruct])
+        return cmd_args
+
+
     def local_qwen_ready(project: dict) -> bool:
         cfg = local_qwen_config(project)
         if not bool(cfg.get("enabled", False)):
@@ -148,9 +237,9 @@ GENERATE_TTS_PUBLISH = dedent(
             "voice_name": cfg.get("voice_name", ""),
             "model_id": cfg.get("model_id", "eleven_multilingual_v2"),
             "output_format": cfg.get("output_format", "mp3_44100_128"),
-            "stability": cfg.get("stability", 0.4),
+            "stability": cfg.get("stability", 0.72),
             "similarity_boost": cfg.get("similarity_boost", 0.8),
-            "style": cfg.get("style", 0.15),
+            "style": cfg.get("style", 0.05),
             "use_speaker_boost": cfg.get("use_speaker_boost", True),
             "language_code": cfg.get("language_code", "zh"),
         }
@@ -257,6 +346,7 @@ GENERATE_TTS_PUBLISH = dedent(
             "--output-dir",
             str(root / "audio"),
         ]
+        cmd.extend(build_local_qwen_args(project))
         if force:
             cmd.append("--force")
 
@@ -679,6 +769,92 @@ GENERATE_TTS_LOCAL_QWEN = dedent(
         return parser.parse_args()
 
 
+    def local_qwen_config(project: dict) -> dict:
+        settings = project.get("voice_settings", {})
+        return settings.get("local_qwen", {}) or {}
+
+
+    def choose_list(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        items: list[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                items.append(text)
+        return items
+
+
+    def join_instruction_parts(*parts: str) -> str:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            text = str(part or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            cleaned.append(text)
+        return " ".join(cleaned)
+
+
+    def build_qwen_cli_args(project: dict) -> list[str]:
+        local_qwen = local_qwen_config(project)
+        voice_persona = project.get("voice_persona", {}) or {}
+        voice_consistency = project.get("voice_consistency", {}) or {}
+        acceptance = project.get("acceptance", {}) or {}
+
+        cmd_args: list[str] = []
+        for flag, key in (
+            ("--profile", "profile"),
+            ("--speaker", "speaker"),
+            ("--language", "language"),
+            ("--format", "format"),
+            ("--attn-implementation", "attn_implementation"),
+            ("--dtype", "dtype"),
+        ):
+            value = str(local_qwen.get(key) or "").strip()
+            if value:
+                cmd_args.extend([flag, value])
+
+        identity = str(voice_persona.get("identity") or "").strip()
+        core_traits = "、".join(choose_list(voice_persona.get("core_traits")))
+        forbidden_traits = "、".join(choose_list(voice_persona.get("forbidden_traits")))
+        locked_fields = "、".join(choose_list(voice_consistency.get("locked_fields")))
+        anchor_segment = str(voice_consistency.get("anchor_segment_id") or "01").strip()
+        baseline_emotion = str(voice_persona.get("baseline_emotion") or "").strip()
+        pace = str(voice_persona.get("pace") or "").strip()
+        breath = str(voice_persona.get("breath") or "").strip()
+        emphasis = str(voice_persona.get("emphasis") or "").strip()
+        reviewer = str(acceptance.get("reviewer") or "").strip()
+
+        instruct = join_instruction_parts(
+            (
+                f"全程保持同一个中文女声人设：{identity}。"
+                if identity
+                else "全程保持同一个中文女声人设。"
+            ),
+            f"核心气质固定为：{core_traits}。" if core_traits else "",
+            f"禁止出现这些倾向：{forbidden_traits}。" if forbidden_traits else "",
+            (
+                f"情绪基线保持 {baseline_emotion}，语速保持 {pace}，呼吸保持 {breath}，重音规则保持 {emphasis}。"
+                if any([baseline_emotion, pace, breath, emphasis])
+                else ""
+            ),
+            f"整条视频都要延续锚点片段 {anchor_segment} 的同一位说话人、同一音色、同一情绪基线和同一说话习惯。",
+            f"锁定字段：{locked_fields}。" if locked_fields else "",
+            "不要在不同分段之间突然变成熟、变稚嫩、变兴奋、变播音腔，或者像换了另一个人。",
+            "即使切到总结、强调或转场，也只允许轻微关键词强调，不要改变整体音色、人设和说话节奏。",
+            (
+                f"这条视频最终需要通过 {reviewer} 的 voice_consistency 验收，不一致就视为失败。"
+                if reviewer
+                else "这条视频最终需要通过 voice_consistency 验收，不一致就视为失败。"
+            ),
+        )
+        if instruct:
+            cmd_args.extend(["--instruct", instruct])
+        return cmd_args
+
+
     def main() -> None:
         args = parse_args()
         root = Path(args.root).resolve()
@@ -688,7 +864,7 @@ GENERATE_TTS_LOCAL_QWEN = dedent(
         output_dir.mkdir(parents=True, exist_ok=True)
 
         project = json.loads(project_path.read_text(encoding="utf-8"))
-        local_qwen = ((project.get("voice_settings") or {}).get("local_qwen") or {})
+        local_qwen = local_qwen_config(project)
         qwen_python = Path(local_qwen.get("python_executable") or DEFAULT_QWEN_PYTHON)
         qwen_helper = Path(local_qwen.get("helper_script") or DEFAULT_QWEN_HELPER)
 
@@ -707,6 +883,7 @@ GENERATE_TTS_LOCAL_QWEN = dedent(
             "--output-dir",
             str(output_dir),
         ]
+        cmd.extend(build_qwen_cli_args(project))
         if args.segment_ids:
             cmd.extend(["--segment-ids", args.segment_ids])
         if args.force:
@@ -914,7 +1091,7 @@ CHECK_VOICE_ENV = dedent(
     $localQwen = $null
     if (Test-Path $projectJson) {
       try {
-        $project = Get-Content -Raw -Encoding UTF8 $projectJson | ConvertFrom-Json -Depth 8
+        $project = Get-Content -Raw -Encoding UTF8 $projectJson | ConvertFrom-Json
         $localQwen = $project.voice_settings.local_qwen
       } catch {
         $localQwen = $null
@@ -1102,7 +1279,7 @@ QUICK_CHECK = dedent(
                         hard_failures.append(f"missing demo video: {video_path}")
 
         if not has_demo:
-            warnings.append("没有 demo 段；如果这是讲解型视频，建议至少保留一段实机录屏")
+            warnings.append("没有 demo 段；概念型科普可接受，如是工具实操类视频建议补一段录屏")
 
         if hard_failures:
             for item in hard_failures:
@@ -1125,6 +1302,7 @@ QUICK_CHECK = dedent(
 
 PUBLISH_NOTES_MARKER = (
     "- 中文终版优先走 reviewed web voice；除非已经验过中文 API voice，否则不要默认用 ElevenLabs API library voices\n"
+    "- 出片前必须过 acceptance-reviewer：内容深度、UI 服务内容、配音一致性三项都要过\n"
 )
 
 
@@ -1153,6 +1331,32 @@ def merge_project_json(path: Path, provider: str) -> None:
     project["voice_language"] = voice_language
     project["preview_voice_provider"] = "preview-edge-tts"
     project["voice_quality_bar"] = "publish_requires_reviewed_natural_voice_for_chinese"
+    project.setdefault("visual_style", "bilibili-quiet-glass-lab-v3")
+
+    content_strategy = project.setdefault("content_strategy", {})
+    content_strategy.setdefault("series_goal", "把 AI / 技术概念讲成观众能直接带走的判断方法")
+    content_strategy.setdefault("episode_goal", "先拆误解，再给地图，最后给场景化选择")
+    content_strategy.setdefault(
+        "higher_order_takeaway",
+        "不要只解释术语，还要解释这个概念为什么在今天重要，以及它改变了什么判断顺序",
+    )
+    content_strategy.setdefault("main_agent_role", "chief-editor")
+    content_strategy.setdefault(
+        "subagents",
+        ["research-scout", "skeptic-elevator", "visual-architect", "voice-director", "acceptance-reviewer"],
+    )
+
+    ui_system = project.setdefault("ui_system", {})
+    ui_system.setdefault("theme", "quiet-glass-lab-v3")
+    ui_system.setdefault("glass_look", "tinted")
+    ui_system.setdefault(
+        "content_layers",
+        ["content-base", "glass-function-layer", "temporary-explainer-layer"],
+    )
+    ui_system.setdefault(
+        "rules",
+        ["功能层用玻璃，内容层少用玻璃", "每页只保留一个视觉中心", "不要假状态栏", "glass 要为内容退后，不要抢戏"],
+    )
 
     workflow = project.setdefault("voice_workflow", {})
     workflow.setdefault(
@@ -1172,6 +1376,35 @@ def merge_project_json(path: Path, provider: str) -> None:
     voice_profile.setdefault("review_status", "unreviewed")
     voice_profile.setdefault("review_notes", [])
 
+    voice_persona = project.setdefault("voice_persona", {})
+    voice_persona.setdefault("id", "cn_female_steady_graceful_cute_v1")
+    voice_persona.setdefault("display_name", "沉稳大方可爱女声")
+    voice_persona.setdefault("identity", "熟悉 AI 和工具工作流、表达克制但友好的年轻中文女生")
+    voice_persona.setdefault("core_traits", ["沉稳", "大方", "亲和", "轻微可爱"])
+    voice_persona.setdefault("forbidden_traits", ["幼态", "撒娇", "夹子音", "播音腔", "突然兴奋"])
+    voice_persona.setdefault("baseline_emotion", "calm_friendly")
+    voice_persona.setdefault("pace", "medium_steady")
+    voice_persona.setdefault("breath", "light_short_controlled")
+    voice_persona.setdefault("emphasis", "light_keyword_only")
+    voice_persona.setdefault("qwen_base_instruct", LOCAL_QWEN_BASE_INSTRUCT)
+
+    voice_consistency = project.setdefault("voice_consistency", {})
+    voice_consistency.setdefault("anchor_segment_id", "01")
+    voice_consistency.setdefault(
+        "locked_fields",
+        ["profile", "speaker", "language", "voice_id", "model_id", "base_instruct"],
+    )
+    voice_consistency.setdefault("emotion_variance", "low")
+    voice_consistency.setdefault("pace_variance", "low")
+    voice_consistency.setdefault("breath_variance", "low")
+    voice_consistency.setdefault("regen_policy", "regen_outliers_only")
+
+    acceptance = project.setdefault("acceptance", {})
+    acceptance.setdefault("reviewer", "acceptance-reviewer")
+    acceptance.setdefault("must_pass", ["content_depth", "ui_supports_content", "voice_consistency"])
+    acceptance.setdefault("fail_action", "route_back_to_owner_and_regen")
+    acceptance.setdefault("write_back", "summarize_reusable_findings_into_skill")
+
     settings = project.setdefault("voice_settings", {})
     elevenlabs = settings.setdefault("elevenlabs", {})
     current_voice_id = str(elevenlabs.get("voice_id") or "")
@@ -1181,9 +1414,9 @@ def merge_project_json(path: Path, provider: str) -> None:
     elevenlabs.setdefault("voice_name", "")
     elevenlabs.setdefault("model_id", "eleven_multilingual_v2")
     elevenlabs.setdefault("output_format", "mp3_44100_128")
-    elevenlabs.setdefault("stability", 0.4)
+    elevenlabs.setdefault("stability", 0.72)
     elevenlabs.setdefault("similarity_boost", 0.8)
-    elevenlabs.setdefault("style", 0.15)
+    elevenlabs.setdefault("style", 0.05)
     elevenlabs.setdefault("use_speaker_boost", True)
     elevenlabs.setdefault("language_code", "zh")
 
@@ -1198,8 +1431,8 @@ def merge_project_json(path: Path, provider: str) -> None:
     local_qwen.setdefault("speaker", "serena")
     local_qwen.setdefault("language", "Chinese")
     if str(local_qwen.get("instruct") or "") == LOCAL_QWEN_BASE_INSTRUCT:
-        local_qwen["instruct"] = ""
-    local_qwen.setdefault("instruct", "")
+        local_qwen["instruct"] = DEFAULT_PROJECT_QWEN_INSTRUCT
+    local_qwen.setdefault("instruct", DEFAULT_PROJECT_QWEN_INSTRUCT)
     local_qwen.setdefault(
         "model_dir",
         r"C:\Users\Clr\Desktop\Video Maker\TTS\qwen3-tts-1.7b\models\Qwen3-TTS-12Hz-1.7B-CustomVoice",
