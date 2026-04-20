@@ -1,5 +1,7 @@
 # Video Maker
 
+[English](./README.md) | [简体中文](./README.zh-CN.md)
+
 `video-maker` is a Codex skill for end-to-end Bilibili explainer-video production on Windows.
 
 It is built around one practical goal:
