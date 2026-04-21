@@ -11,7 +11,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", required=True)
     parser.add_argument("--topic", required=True)
     parser.add_argument("--slug", required=True)
-    parser.add_argument("--voice-provider", default="auto-natural-tts")
+    parser.add_argument("--voice-provider", default="local-qwen")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 

@@ -7,14 +7,14 @@
 它围绕一个很实际的目标构建：
 
 - 初始化可复用的视频项目
-- 撰写并打磨中文讲解分段文案
+- 先锁内容合同，再编译镜头和页面
 - 渲染幻灯片画面
 - 优先使用本地 Qwen3-TTS 生成旁白
-- 必要时回退到 ElevenLabs 或 Edge
+- 必要时回退到 Edge 预览
 - 在本地拼装最终 MP4
 - 为 B 站上传 worker 准备结构化发布元数据
 
-当前新项目默认视觉系统为 `Quiet Glass Lab v3`：以黑色碳感底色和荧光酸绿为主的 Liquid Glass 风格，参考 iOS 26 / iPadOS 26 的界面气质，并针对 3 到 5 分钟的中文 B 站 tech explainer 做了专门调校。
+当前新项目默认视觉系统为 `Quiet Glass Lab v3`：以黑色碳感底色和荧光酸绿为主的磨砂玻璃风格，但它是内容优先的提示词包，不是固定模板库。
 
 ## 仓库内容
 
@@ -22,7 +22,7 @@
 - `scripts/bootstrap_project.py`：自包含项目初始化脚本
 - `scripts/bootstrap_video_project.py`：基础 B 站视频脚手架生成器
 - `scripts/upgrade_project.py`：优先本地 Qwen 的升级路径和发布辅助脚本
-- `references/`：语音、工作流和 provider 说明
+- `references/`：语音、工作流和验收说明
 - `references/agent-orchestration.md`：推荐的主 agent / 子 agent 内容生产流程
 - `references/video-acceptance-rubric.md`：最终渲染或发布前的 reviewer agent 验收标准
 - `references/quiet-glass-lab-v3.md`：内容优先的 Liquid Glass 规则和设计 token
@@ -124,17 +124,15 @@ C:\Users\...\skills\
 Provider 优先级：
 
 1. `local-qwen`
-2. 已审核的 `elevenlabs-api`
-3. 显式审核通过的 `elevenlabs-web`
-4. `edge-preview`
+2. `edge-preview`
 
 ## 内容系统
 
 当前推荐的生产拆分方式是：
 
-1. 主 agent 担任 `chief-editor`
-2. 侧边子 agent 分别负责调研、质疑、UI 方向和语音一致性
-3. 主 agent 再把这些结果合并成一个简洁的核心判断、一张分段地图，以及一个能发布的最终观点
+1. `chief-editor` 负责整期内容合同
+2. 内容默认串行走 `outline -> depth -> detail -> narration-polish`
+3. `chief-editor` 再编译 `style_contract`、`shot_intents` 和 `segments`
 
 核心规则是：视频不能只停留在“这个词是什么意思”。每一期还应回答它为什么现在重要、它消除了什么误解，以及观众看完后能带走什么判断。
 
@@ -172,7 +170,7 @@ Provider 优先级：
 - 如果任务是本地项目创建、旁白、质检或视频拼装，使用 `video-maker`
 - 如果任务跨入真实可见的 Windows UI 控制，同时使用 `desktop-control-for-windows`
 - 如果是在新机器上首次配置或排障，先运行 `scripts/doctor.py`，再尝试完整发布链路
-- 未来制作 B 站 tech explainer 时，优先使用默认的 `Quiet Glass Lab v3` 模板，只有题材确实不适合时再偏离
+- 未来制作 B 站 tech explainer 时，优先使用默认的 `Quiet Glass Lab v3` 提示词包，只有题材确实不适合时再偏离
 
 ## 许可证
 

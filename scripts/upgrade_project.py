@@ -1,12 +1,22 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
 from textwrap import dedent
 
+from project_defaults import (
+    apply_project_defaults,
+    build_depth_contract_data,
+    build_detail_weave_data,
+    build_narration_polish_data,
+    build_outline_plan_data,
+    build_shot_intents_data,
+    build_style_contract_data,
+    default_shot_role_for_index,
+)
 
-OLD_DEFAULT_ELEVENLABS_VOICE_ID = "XB0fDUnXU5powFXDhCwa"
+
 LOCAL_QWEN_BASE_INSTRUCT = (
     "请用年轻的中文女声做科技讲解。整体气质沉稳、大方、清晰、友好，带一点自然可爱的亲和感。"
     "全程保持同一个人设、同一种情绪基线和同一套说话习惯。"
@@ -15,11 +25,20 @@ LOCAL_QWEN_BASE_INSTRUCT = (
     "不要幼态，不要撒娇，不要夹子音。像二十五岁左右、表达很稳的女生，在冷静而友好地讲解工具、工作流和 AI 概念。"
 )
 
-DEFAULT_PROJECT_QWEN_INSTRUCT = (
-    "请继续沿用完全相同的人设、音色、情绪基线、语速和呼吸风格完成整条视频。"
-    "沉稳、大方、亲和，带一点自然可爱感，但不要幼态，不要撒娇，不要夹子音。"
-    "中速偏稳，轻呼吸，轻强调，不要播音腔，不要突然兴奋。"
-)
+STYLE_FOUNDATION_DIR = Path(__file__).resolve().parents[1] / "references" / "quiet-glass-lab"
+
+LEGACY_MUST_ANSWER = [
+    "这是什么",
+    "为什么现在值得讲",
+    "最容易混淆的点是什么",
+    "最后应该怎么判断或行动",
+]
+
+LEGACY_SCENE_MARKERS = [
+    "Scene placeholder",
+    "先锁内容，再决定这一页长什么样",
+    "prompt-driven layout",
+]
 
 
 GENERATE_TTS_PUBLISH = dedent(
@@ -28,16 +47,9 @@ GENERATE_TTS_PUBLISH = dedent(
 
     import argparse
     import asyncio
-    import json
-    import os
     import subprocess
+    import sys
     from pathlib import Path
-    from urllib.error import HTTPError, URLError
-    from urllib.request import Request, urlopen
-
-
-    OLD_DEFAULT_ELEVENLABS_VOICE_ID = "XB0fDUnXU5powFXDhCwa"
-    AUDIO_EXTENSIONS = (".wav", ".mp3")
 
 
     def parse_args() -> argparse.Namespace:
@@ -46,420 +58,61 @@ GENERATE_TTS_PUBLISH = dedent(
         parser.add_argument(
             "--provider",
             default="auto",
-            choices=["auto", "local-qwen", "elevenlabs-api", "elevenlabs-web", "edge-preview"],
+            choices=["auto", "local-qwen", "edge-preview"],
         )
         parser.add_argument("--force", action="store_true")
         return parser.parse_args()
 
-
-    def load_project(root: Path) -> tuple[dict, list[dict]]:
-        project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8"))
-        segments = json.loads((root / "content" / "segments.json").read_text(encoding="utf-8"))
-        return project, segments
+    from video_pipeline_common import load_project, local_qwen_ready
 
 
-    def resolve_env(name: str) -> str | None:
-        value = os.environ.get(name)
-        if value:
-            return value
-        try:
-            import winreg
-
-            for hive, subkey in (
-                (winreg.HKEY_CURRENT_USER, r"Environment"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
-            ):
-                try:
-                    with winreg.OpenKey(hive, subkey) as key:
-                        value, _ = winreg.QueryValueEx(key, name)
-                        if value:
-                            return str(value)
-                except FileNotFoundError:
-                    continue
-        except Exception:
-            return None
-        return None
-
-
-    def target_language(project: dict) -> str:
-        return str(project.get("voice_language") or "zh-CN")
-
-
-    def is_chinese_target(project: dict) -> bool:
-        return target_language(project).lower().startswith("zh")
-
-
-    def approved_api_voice(project: dict) -> bool:
-        voice_profile = project.get("voice_profile", {})
-        review_status = str(voice_profile.get("review_status") or "").lower()
-        mode = str(voice_profile.get("mode") or "").lower()
-        voice_locale = str(voice_profile.get("locale") or "").lower()
-        source_type = str(voice_profile.get("source_type") or "").lower()
-        if review_status != "passed":
-            return False
-        if mode != "elevenlabs-api":
-            return False
-        if source_type == "library":
-            return False
-        if is_chinese_target(project) and voice_locale and not voice_locale.startswith("zh"):
-            return False
-        voice_id = str((project.get("voice_settings", {}).get("elevenlabs", {}) or {}).get("voice_id") or "")
-        if not voice_id or voice_id == OLD_DEFAULT_ELEVENLABS_VOICE_ID:
-            return False
-        return True
-
-
-    def local_qwen_config(project: dict) -> dict:
-        settings = project.get("voice_settings", {})
-        return settings.get("local_qwen", {}) or {}
-
-
-    def choose_list(value: object) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        items: list[str] = []
-        for item in value:
-            text = str(item or "").strip()
-            if text:
-                items.append(text)
-        return items
-
-
-    def join_instruction_parts(*parts: str) -> str:
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        for part in parts:
-            text = str(part or "").strip()
-            if not text or text in seen:
-                continue
-            seen.add(text)
-            cleaned.append(text)
-        return " ".join(cleaned)
-
-
-    def build_local_qwen_args(project: dict) -> list[str]:
-        local_qwen = local_qwen_config(project)
-        voice_persona = project.get("voice_persona", {}) or {}
-        voice_consistency = project.get("voice_consistency", {}) or {}
-        acceptance = project.get("acceptance", {}) or {}
-
-        cmd_args: list[str] = []
-        for flag, key in (
-            ("--profile", "profile"),
-            ("--speaker", "speaker"),
-            ("--language", "language"),
-            ("--format", "format"),
-            ("--attn-implementation", "attn_implementation"),
-            ("--dtype", "dtype"),
-        ):
-            value = str(local_qwen.get(key) or "").strip()
-            if value:
-                cmd_args.extend([flag, value])
-
-        identity = str(voice_persona.get("identity") or "").strip()
-        core_traits = "、".join(choose_list(voice_persona.get("core_traits")))
-        forbidden_traits = "、".join(choose_list(voice_persona.get("forbidden_traits")))
-        locked_fields = "、".join(choose_list(voice_consistency.get("locked_fields")))
-        anchor_segment = str(voice_consistency.get("anchor_segment_id") or "01").strip()
-        baseline_emotion = str(voice_persona.get("baseline_emotion") or "").strip()
-        pace = str(voice_persona.get("pace") or "").strip()
-        breath = str(voice_persona.get("breath") or "").strip()
-        emphasis = str(voice_persona.get("emphasis") or "").strip()
-        reviewer = str(acceptance.get("reviewer") or "").strip()
-
-        instruct = join_instruction_parts(
-            (
-                f"全程保持同一个中文女声人设：{identity}。"
-                if identity
-                else "全程保持同一个中文女声人设。"
-            ),
-            f"核心气质固定为：{core_traits}。" if core_traits else "",
-            f"禁止出现这些倾向：{forbidden_traits}。" if forbidden_traits else "",
-            (
-                f"情绪基线保持 {baseline_emotion}，语速保持 {pace}，呼吸保持 {breath}，重音规则保持 {emphasis}。"
-                if any([baseline_emotion, pace, breath, emphasis])
-                else ""
-            ),
-            (
-                f"整条视频都要延续锚点片段 {anchor_segment} 的同一位说话人、同一音色、同一情绪基线和同一说话习惯。"
-            ),
-            f"锁定字段：{locked_fields}。" if locked_fields else "",
-            "不要在不同分段之间突然变成熟、变稚嫩、变兴奋、变播音腔，或者像换了另一个人。",
-            "即使切到总结、强调或转场，也只允许轻微关键词强调，不要改变整体音色、人设和说话节奏。",
-            (
-                f"这条视频最终需要通过 {reviewer} 的 voice_consistency 验收，不一致就视为失败。"
-                if reviewer
-                else "这条视频最终需要通过 voice_consistency 验收，不一致就视为失败。"
-            ),
-        )
-        if instruct:
-            cmd_args.extend(["--instruct", instruct])
-        return cmd_args
-
-
-    def local_qwen_ready(project: dict) -> bool:
-        cfg = local_qwen_config(project)
-        if not bool(cfg.get("enabled", False)):
-            return False
-        python_executable = Path(str(cfg.get("python_executable") or ""))
-        helper_script = Path(str(cfg.get("helper_script") or ""))
-        return python_executable.exists() and helper_script.exists()
-
-
-    def reviewed_web_audio_ready(root: Path, project: dict, segments: list[dict]) -> bool:
-        review_status = str((project.get("voice_profile", {}) or {}).get("review_status", "unreviewed")).lower()
-        if review_status != "passed":
-            return False
-        return all(find_existing_audio(root, item["id"]) for item in segments)
-
-
-    def resolve_provider(root: Path, project: dict, segments: list[dict], requested: str) -> str:
+    def choose_provider(root: Path, project: dict, segments: list[dict], requested: str) -> str:
         if requested != "auto":
             return requested
-        if is_chinese_target(project):
-            if local_qwen_ready(project):
-                return "local-qwen"
-            if resolve_env("ELEVENLABS_API_KEY") and approved_api_voice(project):
-                return "elevenlabs-api"
-            if resolve_env("ELEVENLABS_API_KEY") and reviewed_web_audio_ready(root, project, segments):
-                return "elevenlabs-web"
-            return "edge-preview"
-        if resolve_env("ELEVENLABS_API_KEY") and approved_api_voice(project):
-            return "elevenlabs-api"
+        if local_qwen_ready(project):
+            return "local-qwen"
         return "edge-preview"
 
 
-    def elevenlabs_config(project: dict) -> dict:
-        settings = project.get("voice_settings", {})
-        cfg = settings.get("elevenlabs", {})
-        return {
-            "voice_id": cfg.get("voice_id") or resolve_env("ELEVENLABS_VOICE_ID") or "",
-            "voice_name": cfg.get("voice_name", ""),
-            "model_id": cfg.get("model_id", "eleven_multilingual_v2"),
-            "output_format": cfg.get("output_format", "mp3_44100_128"),
-            "stability": cfg.get("stability", 0.72),
-            "similarity_boost": cfg.get("similarity_boost", 0.8),
-            "style": cfg.get("style", 0.05),
-            "use_speaker_boost": cfg.get("use_speaker_boost", True),
-            "language_code": cfg.get("language_code", "zh"),
-        }
-
-
-    def edge_config(project: dict) -> dict:
-        settings = project.get("voice_settings", {})
-        cfg = settings.get("edge_preview", {})
-        return {
-            "voice": cfg.get("voice", "zh-CN-XiaoxiaoNeural"),
-            "rate": cfg.get("rate", "+2%"),
-            "pitch": cfg.get("pitch", "+0Hz"),
-        }
-
-
-    def audio_candidates(root: Path, seg_id: str) -> list[Path]:
-        return [root / "audio" / f"{seg_id}{ext}" for ext in AUDIO_EXTENSIONS]
-
-
-    def find_existing_audio(root: Path, seg_id: str) -> Path | None:
-        for candidate in audio_candidates(root, seg_id):
-            if candidate.exists():
-                return candidate
-        return None
-
-
-    def build_web_manifest(root: Path, project: dict, segments: list[dict]) -> Path:
-        workflow = project.get("voice_workflow", {})
-        manifest_rel = workflow.get("web_manifest", "voice_jobs/web_tts_manifest.json")
-        manifest_path = root / manifest_rel
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        voice_profile = project.get("voice_profile", {})
-        manifest = {
-            "topic": project.get("topic", root.name),
-            "target_language": target_language(project),
-            "publish_mode": workflow.get("publish_mode", "elevenlabs-web-first"),
-            "accent_review_required": bool(workflow.get("accent_review_required", True)),
-            "recommended_actions": [
-                "Choose a Chinese-native or clearly Chinese-capable voice.",
-                "Do not use an English-native voice for Chinese narration.",
-                "After listening, update project.json voice_profile.review_status.",
-            ],
-            "voice_profile": {
-                "provider": voice_profile.get("provider", ""),
-                "mode": voice_profile.get("mode", ""),
-                "voice_name": voice_profile.get("voice_name", ""),
-                "locale": voice_profile.get("locale", ""),
-                "source_type": voice_profile.get("source_type", ""),
-                "review_status": voice_profile.get("review_status", "unreviewed"),
-            },
-            "segments": [],
-        }
-        for item in segments:
-            manifest["segments"].append(
-                {
-                    "id": item["id"],
-                    "text": item["voice"],
-                    "target_audio_preferred": str((root / "audio" / f"{item['id']}.wav").resolve()),
-                    "target_audio_candidates": [str(path.resolve()) for path in audio_candidates(root, item["id"])],
-                }
-            )
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        return manifest_path
-
-
-    def ensure_web_audio_ready(root: Path, project: dict, segments: list[dict], force: bool) -> None:
-        manifest_path = build_web_manifest(root, project, segments)
-        voice_profile = project.get("voice_profile", {})
-        review_status = str(voice_profile.get("review_status", "unreviewed")).lower()
-        missing = []
-        for item in segments:
-            if not find_existing_audio(root, item["id"]):
-                missing.extend(str(path) for path in audio_candidates(root, item["id"]))
-
-        if force or missing or review_status != "passed":
-            raise RuntimeError(
-                "Chinese publish path requires reviewed web-generated audio.\n"
-                f"Manifest written to: {manifest_path}\n"
-                "Use the ElevenLabs website with a Chinese-native voice, download each segment, "
-                "place them at the manifest target paths, then optionally run record_voice_profile.py "
-                "to mark the accepted voice."
-            )
-
-        print(f"[tts] provider=elevenlabs-web")
-        print(f"[tts] using existing reviewed web audio files; manifest at {manifest_path}")
-
-
-    def run_local_qwen(root: Path, project: dict, force: bool) -> None:
-        cfg = local_qwen_config(project)
-        qwen_python = Path(str(cfg.get("python_executable") or ""))
-        qwen_helper = Path(str(cfg.get("helper_script") or ""))
-        if not qwen_python.exists():
-            raise FileNotFoundError(f"Missing Qwen python executable: {qwen_python}")
-        if not qwen_helper.exists():
-            raise FileNotFoundError(f"Missing Qwen helper script: {qwen_helper}")
-
+    def run_local_qwen(root: Path, force: bool) -> None:
+        script = root / "scripts" / "generate_tts_local_qwen.py"
         cmd = [
-            str(qwen_python),
-            str(qwen_helper),
-            "--segments-json",
-            str(root / "content" / "segments.json"),
-            "--project-json",
-            str(root / "content" / "project.json"),
-            "--output-dir",
-            str(root / "audio"),
+            sys.executable,
+            str(script),
+            "--root",
+            str(root),
         ]
-        cmd.extend(build_local_qwen_args(project))
         if force:
             cmd.append("--force")
-
         subprocess.run(cmd, check=True)
 
 
-    def synthesize_elevenlabs(text: str, out_path: Path, cfg: dict, previous_text: str, next_text: str) -> None:
-        api_key = resolve_env("ELEVENLABS_API_KEY")
-        if not api_key:
-            raise RuntimeError("ELEVENLABS_API_KEY is not set")
-        if not cfg["voice_id"]:
-            raise RuntimeError(
-                "No approved ElevenLabs API voice_id configured. "
-                "For Chinese narration, prefer the web workflow unless you have a reviewed Chinese-capable API voice."
-            )
-
-        payload = {
-            "text": text,
-            "model_id": cfg["model_id"],
-            "output_format": cfg["output_format"],
-            "voice_settings": {
-                "stability": cfg["stability"],
-                "similarity_boost": cfg["similarity_boost"],
-                "style": cfg["style"],
-                "use_speaker_boost": cfg["use_speaker_boost"],
-            },
-            "language_code": cfg["language_code"],
-        }
-        if previous_text:
-            payload["previous_text"] = previous_text
-        if next_text:
-            payload["next_text"] = next_text
-
-        req = Request(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{cfg['voice_id']}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "xi-api-key": api_key,
-                "Content-Type": "application/json",
-                "Accept": "audio/mpeg",
-            },
-            method="POST",
-        )
-        try:
-            with urlopen(req) as response:
-                out_path.write_bytes(response.read())
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            if exc.code == 402 and "paid_plan_required" in detail:
-                raise RuntimeError(
-                    "ElevenLabs API rejected this voice on the current plan. "
-                    "This usually means a library voice cannot be used via API on a free plan. "
-                    "Switch to the website generation workflow and choose a Chinese-native voice."
-                ) from exc
-            raise RuntimeError(f"ElevenLabs HTTP {exc.code}: {detail}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"ElevenLabs request failed: {exc}") from exc
-
-
-    async def synthesize_edge(text: str, out_path: Path, cfg: dict) -> None:
-        import edge_tts
-
-        communicate = edge_tts.Communicate(
-            text=text,
-            voice=cfg["voice"],
-            rate=cfg["rate"],
-            pitch=cfg["pitch"],
-        )
-        await communicate.save(str(out_path))
+    def run_edge_preview(root: Path, force: bool) -> None:
+        script = root / "scripts" / "generate_tts_edge.py"
+        cmd = [
+            sys.executable,
+            str(script),
+            "--root",
+            str(root),
+        ]
+        if force:
+            cmd.append("--force")
+        subprocess.run(cmd, check=True)
 
 
     async def main() -> None:
         args = parse_args()
         root = Path(args.root).resolve()
         project, segments = load_project(root)
-        provider = resolve_provider(root, project, segments, args.provider)
-
-        if provider == "elevenlabs-api" and not resolve_env("ELEVENLABS_API_KEY"):
-            raise RuntimeError("Requested provider=elevenlabs-api but ELEVENLABS_API_KEY is missing")
-
-        out_dir = root / "audio"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        provider = choose_provider(root, project, segments, args.provider)
 
         if provider == "local-qwen":
             print("[tts] provider=local-qwen")
-            run_local_qwen(root, project, args.force)
+            run_local_qwen(root, args.force)
             return
 
-        if provider == "elevenlabs-web":
-            ensure_web_audio_ready(root, project, segments, args.force)
-            return
-
-        print(f"[tts] provider={provider}")
-        if provider == "edge-preview" and args.provider == "auto":
-            print("[tts] note: local Qwen / reviewed ElevenLabs provider not ready; using Edge preview voice")
-
-        eleven_cfg = elevenlabs_config(project)
-        edge_cfg = edge_config(project)
-
-        for idx, item in enumerate(segments):
-            out_path = out_dir / f"{item['id']}.mp3"
-            existing = find_existing_audio(root, item["id"])
-            if existing and not args.force:
-                continue
-
-            previous_text = segments[idx - 1]["voice"] if idx > 0 else ""
-            next_text = segments[idx + 1]["voice"] if idx + 1 < len(segments) else ""
-            print(f"[tts] {item['id']} -> {out_path}")
-
-            if provider == "elevenlabs-api":
-                synthesize_elevenlabs(item["voice"], out_path, eleven_cfg, previous_text, next_text)
-            else:
-                await synthesize_edge(item["voice"], out_path, edge_cfg)
+        print("[tts] provider=edge-preview")
+        run_edge_preview(root, args.force)
 
 
     if __name__ == "__main__":
@@ -477,9 +130,6 @@ PREPARE_WEB_TTS_MANIFEST = dedent(
     from pathlib import Path
 
 
-    AUDIO_EXTENSIONS = (".wav", ".mp3")
-
-
     def parse_args() -> argparse.Namespace:
         parser = argparse.ArgumentParser()
         parser.add_argument("--root", required=True)
@@ -489,44 +139,33 @@ PREPARE_WEB_TTS_MANIFEST = dedent(
     def main() -> None:
         args = parse_args()
         root = Path(args.root).resolve()
-        project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8"))
-        segments = json.loads((root / "content" / "segments.json").read_text(encoding="utf-8"))
+        project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8-sig"))
+        segments = json.loads((root / "content" / "segments.json").read_text(encoding="utf-8-sig"))
 
-        workflow = project.get("voice_workflow", {})
-        manifest_rel = workflow.get("web_manifest", "voice_jobs/web_tts_manifest.json")
-        manifest_path = root / manifest_rel
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-
-        voice_profile = project.get("voice_profile", {})
         manifest = {
             "topic": project.get("topic", root.name),
-            "target_language": project.get("voice_language", "zh-CN"),
-            "publish_mode": workflow.get("publish_mode", "elevenlabs-web-first"),
-            "accent_review_required": bool(workflow.get("accent_review_required", True)),
-            "voice_profile": {
-                "provider": voice_profile.get("provider", ""),
-                "mode": voice_profile.get("mode", ""),
-                "voice_name": voice_profile.get("voice_name", ""),
-                "locale": voice_profile.get("locale", ""),
-                "source_type": voice_profile.get("source_type", ""),
-                "review_status": voice_profile.get("review_status", "unreviewed"),
-            },
+            "voice_language": project.get("voice_language", "zh-CN"),
+            "narration_mode": ((project.get("voice_workflow") or {}).get("narration_mode") or "master-track-preferred"),
+            "full_narration_text": "\n\n".join(str(item.get("voice") or "").strip() for item in segments if str(item.get("voice") or "").strip()),
+            "preferred_master_audio": str((root / "audio" / "master.wav").resolve()),
             "segments": [],
         }
         for item in segments:
             manifest["segments"].append(
                 {
                     "id": item["id"],
-                    "text": item["voice"],
-                    "target_audio_preferred": str((root / "audio" / f"{item['id']}.wav").resolve()),
+                    "text": item.get("voice", ""),
                     "target_audio_candidates": [
-                        str((root / "audio" / f"{item['id']}{ext}").resolve()) for ext in AUDIO_EXTENSIONS
+                        str((root / "audio" / f"{item['id']}.wav").resolve()),
+                        str((root / "audio" / f"{item['id']}.mp3").resolve()),
                     ],
                 }
             )
 
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(str(manifest_path))
+        out_path = root / "voice_jobs" / "web_tts_manifest.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(out_path)
 
 
     if __name__ == "__main__":
@@ -550,74 +189,24 @@ PREPARE_PUBLISH_JOB = dedent(
         return parser.parse_args()
 
 
-    def parse_sections(text: str) -> dict[str, list[str]]:
-        sections: dict[str, list[str]] = {}
-        current = "__root__"
-        sections[current] = []
-        for raw_line in text.splitlines():
-            line = raw_line.rstrip()
-            if line.startswith("#"):
-                current = line.lstrip("#").strip()
-                sections.setdefault(current, [])
-                continue
-            sections.setdefault(current, []).append(line)
-        return sections
-
-
-    def pick_title(sections: dict[str, list[str]], fallback: str) -> str:
-        for key in ("建议标题", "标题候选"):
-            for line in sections.get(key, []):
-                cleaned = line.strip().lstrip("-").strip()
-                if cleaned and not cleaned[0].isdigit():
-                    return cleaned
-                if ". " in cleaned:
-                    suffix = cleaned.split(". ", 1)[1].strip()
-                    if suffix:
-                        return suffix
-        return fallback
-
-
-    def pick_description(sections: dict[str, list[str]], fallback: str) -> str:
-        lines = [line.strip() for line in sections.get("简介", []) if line.strip()]
-        return "\n".join(lines) if lines else fallback
-
-
-    def pick_tags(sections: dict[str, list[str]]) -> list[str]:
-        tags: list[str] = []
-        for line in sections.get("标签建议", []):
-            cleaned = line.strip()
-            if cleaned.startswith("-"):
-                cleaned = cleaned[1:].strip()
-            if cleaned and cleaned not in tags:
-                tags.append(cleaned)
-        return tags
-
-
     def main() -> None:
         args = parse_args()
         root = Path(args.root).resolve()
-        project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8"))
-        notes_path = root / "publish_notes.md"
-        notes_text = notes_path.read_text(encoding="utf-8") if notes_path.exists() else ""
-        sections = parse_sections(notes_text)
-
-        topic = str(project.get("topic") or root.name)
-        video_path = root / str(project.get("output_name") or f"{root.name}.mp4")
-        payload = {
-            "topic": topic,
-            "video_path": str(video_path.resolve()),
-            "title": pick_title(sections, topic),
-            "description": pick_description(sections, topic),
-            "tags": pick_tags(sections),
-            "publish_notes_path": str(notes_path.resolve()),
-            "project_json_path": str((root / "content" / "project.json").resolve()),
-            "segments_json_path": str((root / "content" / "segments.json").resolve()),
+        project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8-sig"))
+        notes = (root / "publish_notes.md").read_text(encoding="utf-8-sig") if (root / "publish_notes.md").exists() else ""
+        video_name = project.get("output_name") or f"{root.name}.mp4"
+        job = {
+            "topic": project.get("topic", root.name),
+            "video_path": str((root / video_name).resolve()),
+            "notes_path": str((root / "publish_notes.md").resolve()),
+            "publish_notes_markdown": notes,
+            "style": project.get("visual_style", "quiet-glass-lab"),
+            "voice_provider": project.get("voice_provider", "local-qwen"),
         }
-
         out_path = root / "publish" / "bilibili_publish_job.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(str(out_path))
+        out_path.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(out_path)
 
 
     if __name__ == "__main__":
@@ -638,17 +227,11 @@ RECORD_VOICE_PROFILE = dedent(
     def parse_args() -> argparse.Namespace:
         parser = argparse.ArgumentParser()
         parser.add_argument("--root", required=True)
-        parser.add_argument("--provider", required=True)
-        parser.add_argument("--mode", required=True)
+        parser.add_argument("--provider", default="")
         parser.add_argument("--voice-name", default="")
-        parser.add_argument("--voice-id", default="")
         parser.add_argument("--locale", default="")
         parser.add_argument("--source-type", default="")
-        parser.add_argument(
-            "--review-status",
-            default="unreviewed",
-            choices=["passed", "failed", "unreviewed"],
-        )
+        parser.add_argument("--review-status", default="passed")
         parser.add_argument("--note", action="append", default=[])
         return parser.parse_args()
 
@@ -656,28 +239,18 @@ RECORD_VOICE_PROFILE = dedent(
     def main() -> None:
         args = parse_args()
         root = Path(args.root).resolve()
-        project_path = root / "content" / "project.json"
-        project = json.loads(project_path.read_text(encoding="utf-8"))
-
-        voice_profile = project.setdefault("voice_profile", {})
-        voice_profile["provider"] = args.provider
-        voice_profile["mode"] = args.mode
-        voice_profile["voice_name"] = args.voice_name
-        voice_profile["voice_id"] = args.voice_id
-        voice_profile["locale"] = args.locale
-        voice_profile["source_type"] = args.source_type
-        voice_profile["review_status"] = args.review_status
-        voice_profile["review_notes"] = list(args.note)
-
-        settings = project.setdefault("voice_settings", {})
-        elevenlabs = settings.setdefault("elevenlabs", {})
-        if args.voice_id:
-            elevenlabs["voice_id"] = args.voice_id
-        if args.voice_name:
-            elevenlabs["voice_name"] = args.voice_name
-
-        project_path.write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print("[ok] voice profile updated")
+        path = root / "content" / "project.json"
+        project = json.loads(path.read_text(encoding="utf-8-sig"))
+        profile = project.setdefault("voice_profile", {})
+        profile["provider"] = args.provider
+        profile["voice_name"] = args.voice_name
+        profile["locale"] = args.locale
+        profile["source_type"] = args.source_type
+        profile["review_status"] = args.review_status
+        if args.note:
+            profile["review_notes"] = args.note
+        path.write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(path)
 
 
     if __name__ == "__main__":
@@ -698,17 +271,15 @@ GENERATE_TTS_EDGE = dedent(
     import edge_tts
 
 
-    AUDIO_EXTENSIONS = (".wav", ".mp3")
-
-
     def parse_args() -> argparse.Namespace:
         parser = argparse.ArgumentParser()
         parser.add_argument("--root", required=True)
-        parser.add_argument("--voice", default="zh-CN-XiaoxiaoNeural")
-        parser.add_argument("--rate", default="+2%")
-        parser.add_argument("--pitch", default="+0Hz")
         parser.add_argument("--force", action="store_true")
         return parser.parse_args()
+
+
+    def join_voice_blocks(segments: list[dict]) -> str:
+        return "\n\n".join(str(item.get("voice") or "").strip() for item in segments if str(item.get("voice") or "").strip())
 
 
     async def synthesize(text: str, out_path: Path, voice: str, rate: str, pitch: str) -> None:
@@ -716,25 +287,26 @@ GENERATE_TTS_EDGE = dedent(
         await communicate.save(str(out_path))
 
 
-    def has_existing_audio(audio_dir: Path, seg_id: str) -> bool:
-        return any((audio_dir / f"{seg_id}{ext}").exists() for ext in AUDIO_EXTENSIONS)
-
-
     async def main() -> None:
         args = parse_args()
         root = Path(args.root).resolve()
-        project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8"))
-        if project.get("voice_provider") not in {"preview-edge-tts", "edge-tts"}:
-            print(f"[tts] note: project voice_provider={project.get('voice_provider')}, but edge preview generator was called")
-        content = json.loads((root / "content" / "segments.json").read_text(encoding="utf-8"))
+        project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8-sig"))
+        segments = json.loads((root / "content" / "segments.json").read_text(encoding="utf-8-sig"))
+        edge_cfg = ((project.get("voice_settings") or {}).get("edge_preview") or {})
+        voice = str(edge_cfg.get("voice") or "zh-CN-XiaoxiaoNeural")
+        rate = str(edge_cfg.get("rate") or "+2%")
+        pitch = str(edge_cfg.get("pitch") or "+0Hz")
+
         out_dir = root / "audio"
         out_dir.mkdir(parents=True, exist_ok=True)
-        for item in content:
-            out_path = out_dir / f"{item['id']}.mp3"
-            if has_existing_audio(out_dir, item["id"]) and not args.force:
-                continue
-            print(f"[tts-preview] {item['id']} -> {out_path}")
-            await synthesize(item["voice"], out_path, args.voice, args.rate, args.pitch)
+
+        out_path = out_dir / "master.mp3"
+        if out_path.exists() and not args.force:
+            print(f"[skip] {out_path}")
+            return
+        text = join_voice_blocks(segments)
+        await synthesize(text, out_path, voice, rate, pitch)
+        print(f"[ok] {out_path}")
 
 
     if __name__ == "__main__":
@@ -750,39 +322,23 @@ GENERATE_TTS_LOCAL_QWEN = dedent(
     import argparse
     import json
     import subprocess
+    import tempfile
     from pathlib import Path
 
-
-    DEFAULT_QWEN_PYTHON = Path(
-        r"C:\Users\Clr\Desktop\Video Maker\TTS\qwen3-tts-1.7b\.venv\Scripts\python.exe"
-    )
-    DEFAULT_QWEN_HELPER = Path(
-        r"C:\Users\Clr\Desktop\Video Maker\TTS\qwen3-tts-1.7b\scripts\generate_segments_qwen3.py"
-    )
+    from video_pipeline_common import segment_narration_text
 
 
     def parse_args() -> argparse.Namespace:
         parser = argparse.ArgumentParser()
         parser.add_argument("--root", required=True)
-        parser.add_argument("--segment-ids", help="Comma-separated subset like 01,02,03")
         parser.add_argument("--force", action="store_true")
         return parser.parse_args()
-
-
-    def local_qwen_config(project: dict) -> dict:
-        settings = project.get("voice_settings", {})
-        return settings.get("local_qwen", {}) or {}
 
 
     def choose_list(value: object) -> list[str]:
         if not isinstance(value, list):
             return []
-        items: list[str] = []
-        for item in value:
-            text = str(item or "").strip()
-            if text:
-                items.append(text)
-        return items
+        return [str(item).strip() for item in value if str(item).strip()]
 
 
     def join_instruction_parts(*parts: str) -> str:
@@ -797,101 +353,262 @@ GENERATE_TTS_LOCAL_QWEN = dedent(
         return " ".join(cleaned)
 
 
-    def build_qwen_cli_args(project: dict) -> list[str]:
-        local_qwen = local_qwen_config(project)
+    def parse_int(value: object, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+
+    def statement(text: str, suffix: str = "。") -> str:
+        cleaned = str(text or "").strip().rstrip("。！？!?；;，,、：:")
+        if not cleaned:
+            return ""
+        return f"{cleaned}{suffix}"
+
+
+    def build_local_qwen_config(project: dict) -> dict:
+        local_qwen = ((project.get("voice_settings") or {}).get("local_qwen") or {})
         voice_persona = project.get("voice_persona", {}) or {}
         voice_consistency = project.get("voice_consistency", {}) or {}
-        acceptance = project.get("acceptance", {}) or {}
-
-        cmd_args: list[str] = []
-        for flag, key in (
-            ("--profile", "profile"),
-            ("--speaker", "speaker"),
-            ("--language", "language"),
-            ("--format", "format"),
-            ("--attn-implementation", "attn_implementation"),
-            ("--dtype", "dtype"),
-        ):
-            value = str(local_qwen.get(key) or "").strip()
-            if value:
-                cmd_args.extend([flag, value])
 
         identity = str(voice_persona.get("identity") or "").strip()
         core_traits = "、".join(choose_list(voice_persona.get("core_traits")))
         forbidden_traits = "、".join(choose_list(voice_persona.get("forbidden_traits")))
-        locked_fields = "、".join(choose_list(voice_consistency.get("locked_fields")))
-        anchor_segment = str(voice_consistency.get("anchor_segment_id") or "01").strip()
+        locked_fields = "、".join(choose_list(voice_consistency.get("lock_fields")))
         baseline_emotion = str(voice_persona.get("baseline_emotion") or "").strip()
         pace = str(voice_persona.get("pace") or "").strip()
         breath = str(voice_persona.get("breath") or "").strip()
         emphasis = str(voice_persona.get("emphasis") or "").strip()
-        reviewer = str(acceptance.get("reviewer") or "").strip()
+        strategy = str(voice_consistency.get("strategy") or "master-track-preferred").strip()
+        fallback_mode = str(voice_consistency.get("fallback_mode") or "fix-master-pass-or-preview-edge").strip()
 
         instruct = join_instruction_parts(
+            statement(f"全程保持同一个中文女声人设：{identity}") if identity else "全程保持同一个中文女声人设。",
+            statement(f"核心气质固定为：{core_traits}") if core_traits else "",
+            statement(f"禁止出现这些倾向：{forbidden_traits}") if forbidden_traits else "",
             (
-                f"全程保持同一个中文女声人设：{identity}。"
-                if identity
-                else "全程保持同一个中文女声人设。"
-            ),
-            f"核心气质固定为：{core_traits}。" if core_traits else "",
-            f"禁止出现这些倾向：{forbidden_traits}。" if forbidden_traits else "",
-            (
-                f"情绪基线保持 {baseline_emotion}，语速保持 {pace}，呼吸保持 {breath}，重音规则保持 {emphasis}。"
+                statement(f"情绪基线保持 {baseline_emotion}，语速保持 {pace}，呼吸保持 {breath}，重音规则保持 {emphasis}")
                 if any([baseline_emotion, pace, breath, emphasis])
                 else ""
             ),
-            f"整条视频都要延续锚点片段 {anchor_segment} 的同一位说话人、同一音色、同一情绪基线和同一说话习惯。",
-            f"锁定字段：{locked_fields}。" if locked_fields else "",
-            "不要在不同分段之间突然变成熟、变稚嫩、变兴奋、变播音腔，或者像换了另一个人。",
-            "即使切到总结、强调或转场，也只允许轻微关键词强调，不要改变整体音色、人设和说话节奏。",
-            (
-                f"这条视频最终需要通过 {reviewer} 的 voice_consistency 验收，不一致就视为失败。"
-                if reviewer
-                else "这条视频最终需要通过 voice_consistency 验收，不一致就视为失败。"
-            ),
+            "如果当前链路支持长段合成，优先像一次性录完整条视频一样生成。",
+            statement(f"一致性策略为 {strategy}，退化策略为 {fallback_mode}"),
+            statement(f"锁定字段：{locked_fields}") if locked_fields else "",
+            "不要在不同场景之间突然变成熟、变稚嫩、变兴奋、变播音腔，或者像换了另一个人。",
         )
-        if instruct:
-            cmd_args.extend(["--instruct", instruct])
-        return cmd_args
+        return {
+            "profile": str(local_qwen.get("profile") or "young_calm_cn_female_explainer"),
+            "speaker": str(local_qwen.get("speaker") or "serena"),
+            "language": str(local_qwen.get("language") or "Chinese"),
+            "format": str(local_qwen.get("format") or "wav"),
+            "attn_implementation": str(local_qwen.get("attn_implementation") or "sdpa"),
+            "dtype": str(local_qwen.get("dtype") or "bfloat16"),
+            "model_dir": str(local_qwen.get("model_dir") or ""),
+            "python_executable": str(local_qwen.get("python_executable") or ""),
+            "instruct": instruct,
+            "trim_silence_ms": parse_int(local_qwen.get("trim_silence_ms"), 18),
+            "fade_ms": parse_int(local_qwen.get("fade_ms"), 12),
+        }
+
+
+    def build_items(project: dict, segments: list[dict]) -> list[dict]:
+        items: list[dict] = []
+        for item in segments:
+            text = segment_narration_text(item, project)
+            if not text:
+                continue
+            items.append(
+                {
+                    "id": str(item.get("id") or f"scene-{len(items) + 1:03d}"),
+                    "text": text,
+                }
+            )
+        return items
+
+
+    def run_qwen_job(root: Path, project: dict, force: bool) -> None:
+        segments = json.loads((root / "content" / "segments.json").read_text(encoding="utf-8-sig"))
+        items = build_items(project, segments)
+        if not items:
+            raise RuntimeError("No narration text found in segments.json")
+
+        settings = build_local_qwen_config(project)
+        qwen_python = Path(settings["python_executable"])
+        if not qwen_python.exists():
+            raise FileNotFoundError(f"Missing Qwen python executable: {qwen_python}")
+        model_dir = Path(settings["model_dir"])
+        if not model_dir.exists():
+            raise FileNotFoundError(f"Missing Qwen model directory: {model_dir}")
+
+        master_output = root / "audio" / "master.wav"
+        if master_output.exists() and not force:
+            print(f"[skip] {master_output}")
+            return
+
+        runner = r'''
+    import argparse
+    import json
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    import numpy as np
+    import soundfile as sf
+    import torch
+    from qwen_tts import Qwen3TTSModel
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--job-file", required=True)
+    args = parser.parse_args()
+
+    def load_job(path: str) -> dict:
+        return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+    def trim_edges(audio: np.ndarray, sample_rate: int, margin_ms: int) -> np.ndarray:
+        if margin_ms <= 0 or audio.size == 0:
+            return audio
+        threshold = 0.003
+        active = np.where(np.abs(audio) > threshold)[0]
+        if active.size == 0:
+            return audio
+        margin = int(sample_rate * margin_ms / 1000)
+        start = max(int(active[0]) - margin, 0)
+        end = min(int(active[-1]) + margin + 1, len(audio))
+        return audio[start:end]
+
+
+    def apply_fade(audio: np.ndarray, sample_rate: int, fade_ms: int) -> np.ndarray:
+        if fade_ms <= 0 or audio.size == 0:
+            return audio
+        samples = min(int(sample_rate * fade_ms / 1000), len(audio) // 2)
+        if samples <= 0:
+            return audio
+        ramp = np.linspace(0.0, 1.0, samples, dtype=np.float32)
+        audio[:samples] *= ramp
+        audio[-samples:] *= ramp[::-1]
+        return audio
+
+
+    def convert_with_ffmpeg(src_wav: Path, dst_audio: Path) -> Path:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(src_wav),
+            "-acodec",
+            "libmp3lame",
+            "-ab",
+            "192k",
+            str(dst_audio),
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return dst_audio
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode("utf-8", errors="ignore")
+            if "Unknown encoder" not in stderr:
+                raise
+            fallback_wav = dst_audio.with_suffix(".wav")
+            fallback_wav.write_bytes(src_wav.read_bytes())
+            print(f"[warn] ffmpeg mp3 encoder unavailable, wrote wav instead: {fallback_wav}")
+            return fallback_wav
+
+
+    def save_audio(audio: np.ndarray, sample_rate: int, output_path: Path, fmt: str) -> Path:
+        if fmt == "wav":
+            sf.write(output_path, audio, sample_rate)
+            return output_path
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_wav = Path(temp_file.name)
+        try:
+            sf.write(temp_wav, audio, sample_rate)
+            return convert_with_ffmpeg(temp_wav, output_path.with_suffix(".mp3"))
+        finally:
+            temp_wav.unlink(missing_ok=True)
+
+
+    def synthesize_text(model, text: str, settings: dict) -> tuple[np.ndarray, int]:
+        wavs, sample_rate = model.generate_custom_voice(
+            text=text,
+            language=settings["language"],
+            speaker=settings["speaker"],
+            instruct=settings["instruct"],
+        )
+        audio = np.asarray(wavs[0], dtype=np.float32).reshape(-1)
+        audio = trim_edges(audio, sample_rate, settings["trim_silence_ms"])
+        audio = apply_fade(audio, sample_rate, settings["fade_ms"])
+        return audio, sample_rate
+
+
+    job = load_job(args.job_file)
+    dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[job["settings"]["dtype"]]
+
+    device_map = "cuda:0" if torch.cuda.is_available() else "cpu"
+    model = Qwen3TTSModel.from_pretrained(
+        job["settings"]["model_dir"],
+        device_map=device_map,
+        dtype=dtype,
+        attn_implementation=job["settings"]["attn_implementation"],
+    )
+
+    print(
+        "[qwen3] "
+        f"profile={job['settings']['profile']} "
+        f"speaker={job['settings']['speaker']} "
+        f"language={job['settings']['language']}"
+    )
+    print(f"[qwen3] instruct={job['settings']['instruct']}")
+
+    output_dir = Path(job["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    full_text = "\n\n".join(item["text"] for item in job["items"] if item["text"].strip())
+    if not full_text:
+        raise RuntimeError("No narration text found for master-track synthesis")
+    master_audio, sample_rate = synthesize_text(model, full_text, job["settings"])
+    out_path = Path(job["master_output"])
+    save_audio(master_audio, sample_rate, out_path, "wav")
+    print(f"[ok] {out_path}")
+    '''
+
+        job = {
+            "output_dir": str((root / "audio").resolve()),
+            "master_output": str(master_output.resolve()),
+            "items": items,
+            "settings": settings,
+        }
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as job_file:
+            json.dump(job, job_file, ensure_ascii=False, indent=2)
+            job_path = Path(job_file.name)
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as runner_file:
+            runner_file.write(runner)
+            runner_path = Path(runner_file.name)
+
+        try:
+            cmd = [
+                str(qwen_python),
+                str(runner_path),
+                "--job-file",
+                str(job_path),
+            ]
+            subprocess.run(cmd, check=True)
+        finally:
+            job_path.unlink(missing_ok=True)
+            runner_path.unlink(missing_ok=True)
 
 
     def main() -> None:
         args = parse_args()
         root = Path(args.root).resolve()
-        project_path = root / "content" / "project.json"
-        segments_path = root / "content" / "segments.json"
-        output_dir = root / "audio"
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        project = json.loads(project_path.read_text(encoding="utf-8"))
-        local_qwen = local_qwen_config(project)
-        qwen_python = Path(local_qwen.get("python_executable") or DEFAULT_QWEN_PYTHON)
-        qwen_helper = Path(local_qwen.get("helper_script") or DEFAULT_QWEN_HELPER)
-
-        if not qwen_python.exists():
-            raise FileNotFoundError(f"Missing Qwen python executable: {qwen_python}")
-        if not qwen_helper.exists():
-            raise FileNotFoundError(f"Missing Qwen helper script: {qwen_helper}")
-
-        cmd = [
-            str(qwen_python),
-            str(qwen_helper),
-            "--segments-json",
-            str(segments_path),
-            "--project-json",
-            str(project_path),
-            "--output-dir",
-            str(output_dir),
-        ]
-        cmd.extend(build_qwen_cli_args(project))
-        if args.segment_ids:
-            cmd.extend(["--segment-ids", args.segment_ids])
-        if args.force:
-            cmd.append("--force")
-
-        print("[tts] provider=local-qwen")
-        print(f"[tts] helper={qwen_helper}")
-        subprocess.run(cmd, check=True)
+        project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8-sig"))
+        (root / "audio").mkdir(parents=True, exist_ok=True)
+        run_qwen_job(root, project, args.force)
 
 
     if __name__ == "__main__":
@@ -948,97 +665,200 @@ ASSEMBLE_VIDEO = dedent(
         subprocess.run(cmd, check=True)
 
 
-    def resolve_audio_path(audio_dir: Path, seg_id: str) -> Path:
-        for ext in AUDIO_EXTENSIONS:
-            candidate = audio_dir / f"{seg_id}{ext}"
+    def find_master_audio(root: Path) -> Path | None:
+        for name in ("master.wav", "master.mp3"):
+            candidate = root / "audio" / name
             if candidate.exists():
                 return candidate
-        expected = ", ".join(str(audio_dir / f"{seg_id}{ext}") for ext in AUDIO_EXTENSIONS)
-        raise FileNotFoundError(f"Missing audio for {seg_id}. Looked for: {expected}")
+        return None
+
+
+    def text_weight(text: str) -> float:
+        cleaned = text.strip()
+        if not cleaned:
+            return 1.0
+        punctuation_bonus = sum(cleaned.count(ch) for ch in "，。！？；：,.!?;:")
+        return max(len(cleaned) + punctuation_bonus * 2, 1)
+
+
+    def scene_duration_plan(root: Path, ffmpeg: str, segments: list[dict], total_duration: float) -> dict[str, float]:
+        explicit: dict[str, float] = {}
+        weighted: list[tuple[str, float]] = []
+
+        for item in segments:
+            seg_id = item["id"]
+            duration_sec = item.get("duration_sec")
+            if duration_sec:
+                explicit[seg_id] = float(duration_sec)
+                continue
+            spoken_text = (
+                item.get("tts_text")
+                or item.get("spoken_text")
+                or item.get("voice_spoken")
+                or item.get("narration_text")
+                or item.get("voice")
+                or ""
+            )
+            weighted.append((seg_id, float(item.get("duration_weight") or text_weight(str(spoken_text)))))
+
+        remaining = max(total_duration - sum(explicit.values()), 0.0)
+        if not weighted:
+            return explicit
+        total_weight = sum(weight for _, weight in weighted) or 1.0
+        for seg_id, weight in weighted:
+            explicit[seg_id] = remaining * (weight / total_weight)
+        return explicit
+
+
+    def build_slide_clip(ffmpeg: str, image: Path, out_clip: Path, duration: float, fps: int, with_audio: Path | None = None) -> None:
+        fade_out = max(duration - 0.45, 0)
+        vf = (
+            "scale=1920:1080:force_original_aspect_ratio=decrease,"
+            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=#020302,"
+            f"fade=t=in:st=0:d=0.35,fade=t=out:st={fade_out:.2f}:d=0.35"
+        )
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-loop",
+            "1",
+            "-framerate",
+            str(fps),
+            "-i",
+            str(image),
+        ]
+        if with_audio:
+            cmd.extend(["-i", str(with_audio)])
+        cmd.extend(
+            [
+                "-vf",
+                vf,
+                "-t",
+                f"{duration:.3f}",
+                "-r",
+                str(fps),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        )
+        if with_audio:
+            cmd.extend(["-c:a", "aac", "-shortest"])
+        else:
+            cmd.append("-an")
+        cmd.append(str(out_clip))
+        run(cmd)
+
+
+    def build_demo_clip(ffmpeg: str, source: Path, out_clip: Path, duration: float, fps: int, with_audio: Path | None = None) -> None:
+        if source.suffix.lower() == ".png":
+            build_slide_clip(ffmpeg, source, out_clip, duration, fps, with_audio)
+            return
+        source_duration = media_duration(ffmpeg, source)
+        ratio = duration / source_duration if source_duration else 1.0
+        vf = (
+            f"setpts={ratio:.6f}*PTS,"
+            "scale=1920:1080:force_original_aspect_ratio=decrease,"
+            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black"
+        )
+        cmd = [ffmpeg, "-y", "-i", str(source)]
+        if with_audio:
+            cmd.extend(["-i", str(with_audio)])
+        cmd.extend(
+            [
+                "-vf",
+                vf,
+                "-r",
+                str(fps),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-t",
+                f"{duration:.3f}",
+            ]
+        )
+        if with_audio:
+            cmd.extend(["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-shortest"])
+        else:
+            cmd.extend(["-an"])
+        cmd.append(str(out_clip))
+        run(cmd)
+
+
+    def placeholder_source(root: Path, item: dict) -> Path:
+        placeholder_html = item.get("placeholder_html") or item.get("html")
+        if not placeholder_html:
+            raise FileNotFoundError(f"No placeholder html for {item['id']}")
+        image = root / "slide_png" / f"{Path(placeholder_html).stem}.png"
+        if not image.exists():
+            raise FileNotFoundError(f"Missing placeholder image: {image}")
+        return image
+
+
+    def concat_video(ffmpeg: str, concat_file: Path, out_path: Path) -> None:
+        run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(out_path)])
 
 
     def main() -> None:
         args = parse_args()
         root = Path(args.root).resolve()
         ffmpeg = find_ffmpeg()
-        project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8"))
-        content = json.loads((root / "content" / "segments.json").read_text(encoding="utf-8"))
+        project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8-sig"))
+        segments = json.loads((root / "content" / "segments.json").read_text(encoding="utf-8-sig"))
 
         clips_dir = root / "clips"
         clips_dir.mkdir(parents=True, exist_ok=True)
         concat_file = clips_dir / "concat.txt"
         concat_lines: list[str] = []
-
-        for item in content:
-            seg_id = item["id"]
-            audio = resolve_audio_path(root / "audio", seg_id)
-            audio_duration = media_duration(ffmpeg, audio)
-            out_clip = clips_dir / f"{seg_id}.mp4"
-
-            if item["type"] == "slide":
-                html_name = Path(item["html"]).stem
-                image = root / "slide_png" / f"{html_name}.png"
-                if not image.exists():
-                    raise FileNotFoundError(f"Missing slide image: {image}")
-                fade_out = max(audio_duration - 0.45, 0)
-                vf = (
-                    "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                    "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=#f4efe7,"
-                    f"fade=t=in:st=0:d=0.35,fade=t=out:st={fade_out:.2f}:d=0.35"
-                )
-                run(
-                    [
-                        ffmpeg, "-y", "-loop", "1", "-framerate", str(args.fps), "-i", str(image),
-                        "-i", str(audio), "-vf", vf, "-t", f"{audio_duration:.3f}", "-r", str(args.fps),
-                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(out_clip),
-                    ]
-                )
-            else:
-                demo = root / item["video"]
-                if not demo.exists():
-                    placeholder_html = item.get("placeholder_html")
-                    if not placeholder_html:
-                        raise FileNotFoundError(f"Missing demo video: {demo}")
-                    image = root / "slide_png" / f"{Path(placeholder_html).stem}.png"
-                    if not image.exists():
-                        raise FileNotFoundError(
-                            f"Missing demo video: {demo}; placeholder slide image also missing: {image}"
-                        )
-                    vf = (
-                        "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black"
-                    )
-                    run(
-                        [
-                            ffmpeg, "-y", "-loop", "1", "-framerate", str(args.fps), "-i", str(image),
-                            "-i", str(audio), "-vf", vf, "-t", f"{audio_duration:.3f}", "-r", str(args.fps),
-                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(out_clip),
-                        ]
-                    )
-                    concat_lines.append(f"file '{out_clip.as_posix()}'")
-                    continue
-                demo_duration = media_duration(ffmpeg, demo)
-                ratio = audio_duration / demo_duration if demo_duration else 1.0
-                vf = (
-                    f"setpts={ratio:.6f}*PTS,"
-                    "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                    "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black"
-                )
-                run(
-                    [
-                        ffmpeg, "-y", "-i", str(demo), "-i", str(audio), "-vf", vf, "-map", "0:v:0",
-                        "-map", "1:a:0", "-r", str(args.fps), "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                        "-c:a", "aac", "-t", f"{audio_duration:.3f}", "-shortest", str(out_clip),
-                    ]
-                )
-
-            concat_lines.append(f"file '{out_clip.as_posix()}'")
-
-        concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
         final_name = project.get("output_name") or (root.name + ".mp4")
         final_path = root / final_name
-        run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(final_path)])
-        print(f"[video] {final_path}")
+
+        master_audio = find_master_audio(root)
+        if master_audio:
+            durations = scene_duration_plan(root, ffmpeg, segments, media_duration(ffmpeg, master_audio))
+            for item in segments:
+                seg_id = item["id"]
+                duration = max(durations.get(seg_id, 0.1), 0.1)
+                out_clip = clips_dir / f"{seg_id}.mp4"
+                if item.get("type") == "demo":
+                    demo = root / item["video"]
+                    source = demo if demo.exists() else placeholder_source(root, item)
+                    build_demo_clip(ffmpeg, source, out_clip, duration, args.fps)
+                else:
+                    image = root / "slide_png" / f"{Path(item['html']).stem}.png"
+                    if not image.exists():
+                        raise FileNotFoundError(f"Missing slide image: {image}")
+                    build_slide_clip(ffmpeg, image, out_clip, duration, args.fps)
+                concat_lines.append(f"file '{out_clip.as_posix()}'")
+
+            concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+            video_only = clips_dir / "_video_only.mp4"
+            concat_video(ffmpeg, concat_file, video_only)
+            run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-i",
+                    str(video_only),
+                    "-i",
+                    str(master_audio),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    str(final_path),
+                ]
+            )
+            print(f"[video] {final_path}")
+            return
+        raise FileNotFoundError("Missing master audio: audio/master.wav or audio/master.mp3")
 
 
     if __name__ == "__main__":
@@ -1077,16 +897,6 @@ CHECK_VOICE_ENV = dedent(
 
     $ErrorActionPreference = "Stop"
 
-    function Get-MaskedState {
-      param([string]$ScopeName)
-      $value = [Environment]::GetEnvironmentVariable("ELEVENLABS_API_KEY", $ScopeName)
-      [PSCustomObject]@{
-        Scope = $ScopeName
-        Present = [bool]$value
-        Preview = if ($value) { ("*" * [Math]::Min($value.Length, 8)) } else { "" }
-      }
-    }
-
     $projectJson = Join-Path (Split-Path -Parent $PSScriptRoot) "content\project.json"
     $localQwen = $null
     if (Test-Path $projectJson) {
@@ -1098,50 +908,26 @@ CHECK_VOICE_ENV = dedent(
       }
     }
 
-    $states = @(
-      Get-MaskedState "Process"
-      Get-MaskedState "User"
-      Get-MaskedState "Machine"
-    )
-
-    $found = $states | Where-Object { $_.Present }
-    $resolvedScope = if ($found) { ($found | Select-Object -First 1).Scope } else { "" }
     $localQwenEnabled = [bool]($localQwen -and $localQwen.enabled)
     $localQwenPython = if ($localQwen) { [string]$localQwen.python_executable } else { "" }
     $localQwenHelper = if ($localQwen) { [string]$localQwen.helper_script } else { "" }
-    $localQwenReady = $localQwenEnabled -and (Test-Path $localQwenPython) -and (Test-Path $localQwenHelper)
+    $localQwenModelDir = if ($localQwen) { [string]$localQwen.model_dir } else { "" }
+    $localQwenReady = $localQwenEnabled -and (Test-Path $localQwenPython) -and (Test-Path $localQwenModelDir)
 
     [PSCustomObject]@{
-      elevenlabs_api_key_present = [bool]$found
-      resolved_scope = $resolvedScope
-      scopes = $states
       local_qwen = [PSCustomObject]@{
         enabled = $localQwenEnabled
         python_executable = $localQwenPython
         helper_script = $localQwenHelper
+        model_dir = $localQwenModelDir
         ready = $localQwenReady
       }
-      recommendation = if ($found) {
-        if ($localQwenReady) {
-          "Local Qwen and ElevenLabs are both available. Auto mode will prefer local Qwen for Chinese narration."
-        } else {
-          "ElevenLabs is available. For Chinese narration, auto mode still prefers local Qwen when configured; otherwise use a reviewed voice path."
-        }
-      } elseif ($localQwenReady) {
-        "Local Qwen is ready. Auto mode will use local Qwen for Chinese narration."
+      recommendation = if ($localQwenReady) {
+        "Local Qwen 12Hz is ready. Auto mode will prefer local Qwen and use one-pass master-track narration for Chinese projects."
       } else {
-        "Neither ElevenLabs nor local Qwen is ready. This project will fall back to Edge preview audio."
+        "Local Qwen 12Hz is not ready. This project will fall back to Edge preview audio until model_dir is fixed."
       }
     } | ConvertTo-Json -Depth 4
-
-    if ($ShowHints -and -not $found) {
-      Write-Host ""
-      Write-Host "Set for current shell:" -ForegroundColor Yellow
-      Write-Host '$env:ELEVENLABS_API_KEY="your_key_here"'
-      Write-Host ""
-      Write-Host "Persist for current user:" -ForegroundColor Yellow
-      Write-Host '[Environment]::SetEnvironmentVariable("ELEVENLABS_API_KEY", "your_key_here", "User")'
-    }
     """
 ).strip() + "\n"
 
@@ -1152,13 +938,8 @@ QUICK_CHECK = dedent(
 
     import argparse
     import json
-    import os
     import sys
     from pathlib import Path
-    import winreg
-
-
-    OLD_DEFAULT_ELEVENLABS_VOICE_ID = "XB0fDUnXU5powFXDhCwa"
 
 
     def parse_args() -> argparse.Namespace:
@@ -1166,24 +947,6 @@ QUICK_CHECK = dedent(
         parser.add_argument("--root", required=True)
         parser.add_argument("--strict", action="store_true")
         return parser.parse_args()
-
-
-    def resolve_env(name: str) -> str | None:
-        value = os.environ.get(name)
-        if value:
-            return value
-        for hive, subkey in (
-            (winreg.HKEY_CURRENT_USER, r"Environment"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
-        ):
-            try:
-                with winreg.OpenKey(hive, subkey) as key:
-                    value, _ = winreg.QueryValueEx(key, name)
-                    if value:
-                        return str(value)
-            except FileNotFoundError:
-                continue
-        return None
 
 
     def main() -> None:
@@ -1195,8 +958,9 @@ QUICK_CHECK = dedent(
         project_path = root / "content" / "project.json"
         segments_path = root / "content" / "segments.json"
         notes_path = root / "publish_notes.md"
+        narration_path = root / "content" / "narration_polish.json"
 
-        for required in [project_path, segments_path, notes_path]:
+        for required in [project_path, segments_path, notes_path, narration_path]:
             if not required.exists():
                 hard_failures.append(f"missing required file: {required}")
 
@@ -1205,32 +969,26 @@ QUICK_CHECK = dedent(
                 print(f"[FAIL] {item}")
             sys.exit(1)
 
-        project = json.loads(project_path.read_text(encoding="utf-8"))
-        segments = json.loads(segments_path.read_text(encoding="utf-8"))
-        elevenlabs_api_key = resolve_env("ELEVENLABS_API_KEY")
+        project = json.loads(project_path.read_text(encoding="utf-8-sig"))
+        segments = json.loads(segments_path.read_text(encoding="utf-8-sig"))
 
-        provider = str(project.get("voice_provider", "auto-natural-tts"))
+        if not segments:
+            hard_failures.append("segments.json is empty; generate a beat-driven scene list before rendering")
+
+        provider = str(project.get("voice_provider", "local-qwen"))
         voice_language = str(project.get("voice_language", "zh-CN")).lower()
-        workflow = project.get("voice_workflow", {})
-        voice_profile = project.get("voice_profile", {})
-        voice_settings = project.get("voice_settings", {}).get("elevenlabs", {})
-        local_qwen = (project.get("voice_settings", {}) or {}).get("local_qwen", {}) or {}
+        workflow = project.get("voice_workflow", {}) or {}
+        voice_profile = project.get("voice_profile", {}) or {}
+        local_qwen = ((project.get("voice_settings") or {}).get("local_qwen") or {})
         local_qwen_enabled = bool(local_qwen.get("enabled", False))
         local_qwen_python = Path(str(local_qwen.get("python_executable") or "")) if local_qwen else Path()
-        local_qwen_helper = Path(str(local_qwen.get("helper_script") or "")) if local_qwen else Path()
-        local_qwen_ready = (
-            local_qwen_enabled
-            and local_qwen_python.exists()
-            and local_qwen_helper.exists()
-        )
+        local_qwen_model_dir = Path(str(local_qwen.get("model_dir") or "")) if local_qwen else Path()
+        local_qwen_ready = local_qwen_enabled and local_qwen_python.exists() and local_qwen_model_dir.exists()
 
         if provider in {"preview-edge-tts", "edge-tts"}:
             warnings.append("voice_provider 仍是预览级 TTS；适合粗剪，不建议直接发布")
-        elif provider in {"local-qwen", "auto-natural-tts"} and local_qwen_enabled and not local_qwen_ready:
-            warnings.append("voice_settings.local_qwen 已启用，但本地 Qwen helper 或 Python 路径不存在")
-        elif provider in {"auto-natural-tts", "elevenlabs", "elevenlabs-api", "elevenlabs-web"}:
-            if not elevenlabs_api_key and not local_qwen_ready:
-                warnings.append("未检测到 ELEVENLABS_API_KEY，且本地 Qwen 未就绪；render_all 将回退到 Edge 预览音轨")
+        elif provider == "local-qwen" and local_qwen_enabled and not local_qwen_ready:
+            warnings.append("voice_settings.local_qwen 已启用，但本地 Qwen 12Hz Python 或 model_dir 路径不存在")
 
         if voice_language.startswith("zh") and workflow.get("accent_review_required", True):
             if provider != "local-qwen" and str(voice_profile.get("review_status", "unreviewed")).lower() != "passed":
@@ -1240,46 +998,29 @@ QUICK_CHECK = dedent(
         if voice_language.startswith("zh") and voice_locale and not voice_locale.startswith("zh"):
             warnings.append(f"当前 voice_profile.locale={voice_locale}；中文旁白存在外国人口音风险")
 
-        source_type = str(voice_profile.get("source_type", "")).lower()
-        mode = str(voice_profile.get("mode", "")).lower()
-        if mode == "elevenlabs-api" and source_type == "library":
-            warnings.append("当前 voice_profile 使用 ElevenLabs library voice API；免费账户常见 402，且中文口音风险更高")
-
-        if voice_language.startswith("zh") and voice_settings.get("voice_id") == OLD_DEFAULT_ELEVENLABS_VOICE_ID:
-            warnings.append("project.json 仍保留旧的默认英文 ElevenLabs voice_id；不应继续用于中文终版")
-
-        if voice_language.startswith("zh") and provider in {"elevenlabs-web"}:
-            manifest_rel = workflow.get("web_manifest", "voice_jobs/web_tts_manifest.json")
-            manifest_path = root / manifest_rel
-            if not manifest_path.exists():
-                warnings.append("中文 web-first 配音还没有 manifest；先运行 prepare_web_tts_manifest.py")
-
-        if not 6 <= len(segments) <= 10:
-            warnings.append(f"当前 segments 数量为 {len(segments)}；讲解视频通常控制在 6-10 段更稳")
-
-        has_demo = False
         for item in segments:
-            voice_len = len(item.get("voice", ""))
-            if voice_len > 140:
-                warnings.append(f"segment {item.get('id')} 旁白过长（{voice_len} 字），建议再压短")
             if item.get("type") == "slide":
                 html_path = root / item["html"]
                 if not html_path.exists():
                     hard_failures.append(f"missing slide html: {html_path}")
             if item.get("type") == "demo":
-                has_demo = True
                 video_path = root / item["video"]
                 if not video_path.exists():
-                    placeholder_html = item.get("placeholder_html")
+                    placeholder_html = item.get("placeholder_html") or item.get("html")
                     if placeholder_html and (root / placeholder_html).exists():
                         warnings.append(
-                            f"segment {item.get('id')} demo 录像缺失；render_all 会先用占位页 {placeholder_html} 顶上"
+                            f"segment {item.get('id')} demo 录像缺失；render_all 会先用占位场景 {placeholder_html} 顶上"
                         )
                     else:
-                        hard_failures.append(f"missing demo video: {video_path}")
+                        hard_failures.append(f"missing demo video and placeholder: {video_path}")
+            if "待由" in str(item.get("voice") or ""):
+                warnings.append(f"segment {item.get('id')} 仍是占位旁白，先完成 narration-polisher + chief-editor 的口播编译再出片")
 
-        if not has_demo:
-            warnings.append("没有 demo 段；概念型科普可接受，如是工具实操类视频建议补一段录屏")
+        if workflow.get("narration_mode") == "master-track-preferred":
+            audio_dir = root / "audio"
+            has_master = any((audio_dir / name).exists() for name in ("master.wav", "master.mp3"))
+            if not has_master:
+                warnings.append("当前项目偏好整段 master-track，但还没有生成 master audio")
 
         if hard_failures:
             for item in hard_failures:
@@ -1300,9 +1041,178 @@ QUICK_CHECK = dedent(
 ).strip() + "\n"
 
 
+RENDER_SLIDES = dedent(
+    r"""
+    param(
+      [string]$Root,
+      [switch]$Force
+    )
+
+    $ErrorActionPreference = "Stop"
+
+    if (-not $Root) {
+      $Root = Split-Path -Parent $PSScriptRoot
+    }
+
+    Add-Type -AssemblyName System.Drawing
+
+    function Save-CroppedSlide {
+      param(
+        [string]$Source,
+        [string]$Target,
+        [int]$Width = 1600,
+        [int]$Height = 900
+      )
+
+      $image = $null
+      $bitmap = $null
+      $graphics = $null
+      try {
+        $image = [System.Drawing.Image]::FromFile($Source)
+        if ($image.Width -lt $Width -or $image.Height -lt $Height) {
+          throw "Rendered image too small: $Source ($($image.Width)x$($image.Height))"
+        }
+        $bitmap = New-Object System.Drawing.Bitmap $Width, $Height
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $graphics.DrawImage(
+          $image,
+          (New-Object System.Drawing.Rectangle 0, 0, $Width, $Height),
+          0,
+          0,
+          $Width,
+          $Height,
+          [System.Drawing.GraphicsUnit]::Pixel
+        )
+        $bitmap.Save($Target, [System.Drawing.Imaging.ImageFormat]::Png)
+      } finally {
+        if ($graphics) { $graphics.Dispose() }
+        if ($bitmap) { $bitmap.Dispose() }
+        if ($image) { $image.Dispose() }
+      }
+    }
+
+    function Test-WhiteFooter {
+      param([string]$Path)
+      $bitmap = $null
+      try {
+        $bitmap = [System.Drawing.Bitmap]::FromFile($Path)
+        $samples = 0
+        $white = 0
+        for ($y = [Math]::Max(0, $bitmap.Height - 36); $y -lt $bitmap.Height; $y += 4) {
+          for ($x = 0; $x -lt $bitmap.Width; $x += 24) {
+            $pixel = $bitmap.GetPixel($x, $y)
+            $brightness = ($pixel.R + $pixel.G + $pixel.B) / 3
+            if ($brightness -ge 250) {
+              $white++
+            }
+            $samples++
+          }
+        }
+        return ($samples -gt 0) -and (($white / [double]$samples) -ge 0.98)
+      } finally {
+        if ($bitmap) { $bitmap.Dispose() }
+      }
+    }
+
+    function Test-WhiteRightStrip {
+      param(
+        [string]$Path,
+        [int]$StripWidth = 28
+      )
+      $bitmap = $null
+      try {
+        $bitmap = [System.Drawing.Bitmap]::FromFile($Path)
+        $samples = 0
+        $white = 0
+        $startX = [Math]::Max(0, $bitmap.Width - $StripWidth)
+        for ($x = $startX; $x -lt $bitmap.Width; $x += 3) {
+          for ($y = 0; $y -lt $bitmap.Height; $y += 12) {
+            $pixel = $bitmap.GetPixel($x, $y)
+            $brightness = ($pixel.R + $pixel.G + $pixel.B) / 3
+            if ($brightness -ge 248) {
+              $white++
+            }
+            $samples++
+          }
+        }
+        return ($samples -gt 0) -and (($white / [double]$samples) -ge 0.985)
+      } finally {
+        if ($bitmap) { $bitmap.Dispose() }
+      }
+    }
+
+    $edge = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+    if (-not (Test-Path $edge)) {
+      throw "Edge not found at $edge"
+    }
+
+    $slidesDir = Join-Path $Root "slides"
+    $outDir = Join-Path $Root "slide_png"
+    $captureWidths = @(1632, 1728, 1792, 1920)
+    New-Item -ItemType Directory -Force $outDir | Out-Null
+
+    $files = Get-ChildItem $slidesDir -Filter "*.html" | Sort-Object Name
+    foreach ($file in $files) {
+      $png = Join-Path $outDir ($file.BaseName + ".png")
+      $tmp = Join-Path $outDir ($file.BaseName + ".raw.png")
+      if ((Test-Path $png) -and -not $Force) {
+        continue
+      }
+
+      if (Test-Path $tmp) {
+        Remove-Item $tmp -Force
+      }
+
+      $uri = "file:///" + ($file.FullName -replace "\\", "/")
+      Write-Output "[slide] $($file.Name) -> $png"
+      $rendered = $false
+      foreach ($captureWidth in $captureWidths) {
+        if (Test-Path $tmp) {
+          Remove-Item $tmp -Force
+        }
+        if (Test-Path $png) {
+          Remove-Item $png -Force
+        }
+
+        & $edge `
+          --headless=new `
+          --disable-gpu `
+          --hide-scrollbars `
+          --run-all-compositor-stages-before-draw `
+          --virtual-time-budget=3000 `
+          --force-device-scale-factor=1 `
+          --window-size=$captureWidth,995 `
+          --screenshot="$tmp" `
+          "$uri" | Out-Null
+
+        Save-CroppedSlide -Source $tmp -Target $png
+        Remove-Item $tmp -Force
+
+        $hasWhiteFooter = Test-WhiteFooter -Path $png
+        $hasWhiteRightStrip = Test-WhiteRightStrip -Path $png
+        if (-not $hasWhiteFooter -and -not $hasWhiteRightStrip) {
+          $rendered = $true
+          break
+        }
+
+        Write-Warning "retrying slide render with wider viewport: $($file.Name) width=$captureWidth footer=$hasWhiteFooter rightStrip=$hasWhiteRightStrip"
+      }
+
+      if (-not $rendered) {
+        throw "Rendered slide still contains browser white region after retries: $png"
+      }
+    }
+    """
+).strip() + "\n"
+
+
 PUBLISH_NOTES_MARKER = (
-    "- 中文终版优先走 reviewed web voice；除非已经验过中文 API voice，否则不要默认用 ElevenLabs API library voices\n"
-    "- 出片前必须过 acceptance-reviewer：内容深度、UI 服务内容、配音一致性三项都要过\n"
+    "- 内容研究默认走 outline -> depth -> detail -> narration polish 四段串行\n"
+    "- narration-polisher 只修逻辑、语法、翻译腔和口播自然度，不改主线判断\n"
+    "- scene 编译默认走 style contract -> shot intent -> scene prompt，不直接套模板\n"
+    "- 风格只锁黑绿 + iOS 18-inspired frosted glass 的材质逻辑与层级，不锁固定模块或固定布局\n"
+    "- slides/base.css 与脚手架 scene HTML 只保留渲染外壳，不内置视觉模板\n"
+    "- 配音默认走本地 Qwen 12Hz 整段单次合成；不行时优先改脚本或退回预览，不再默认分段拼接\n"
 )
 
 
@@ -1311,8 +1221,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", required=True)
     parser.add_argument(
         "--voice-provider",
-        default="auto-natural-tts",
-        choices=["auto-natural-tts", "elevenlabs-api", "elevenlabs-web", "preview-edge-tts"],
+        default="local-qwen",
+        choices=["local-qwen", "preview-edge-tts"],
     )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -1323,156 +1233,830 @@ def write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def merge_project_json(path: Path, provider: str) -> None:
-    project = json.loads(path.read_text(encoding="utf-8"))
-    voice_language = str(project.get("voice_language") or "zh-CN")
-
-    project["voice_provider"] = provider
-    project["voice_language"] = voice_language
-    project["preview_voice_provider"] = "preview-edge-tts"
-    project["voice_quality_bar"] = "publish_requires_reviewed_natural_voice_for_chinese"
-    project.setdefault("visual_style", "bilibili-quiet-glass-lab-v3")
-
-    content_strategy = project.setdefault("content_strategy", {})
-    content_strategy.setdefault("series_goal", "把 AI / 技术概念讲成观众能直接带走的判断方法")
-    content_strategy.setdefault("episode_goal", "先拆误解，再给地图，最后给场景化选择")
-    content_strategy.setdefault(
-        "higher_order_takeaway",
-        "不要只解释术语，还要解释这个概念为什么在今天重要，以及它改变了什么判断顺序",
-    )
-    content_strategy.setdefault("main_agent_role", "chief-editor")
-    content_strategy.setdefault(
-        "subagents",
-        ["research-scout", "skeptic-elevator", "visual-architect", "voice-director", "acceptance-reviewer"],
-    )
-
-    ui_system = project.setdefault("ui_system", {})
-    ui_system.setdefault("theme", "quiet-glass-lab-v3")
-    ui_system.setdefault("glass_look", "tinted")
-    ui_system.setdefault(
-        "content_layers",
-        ["content-base", "glass-function-layer", "temporary-explainer-layer"],
-    )
-    ui_system.setdefault(
-        "rules",
-        ["功能层用玻璃，内容层少用玻璃", "每页只保留一个视觉中心", "不要假状态栏", "glass 要为内容退后，不要抢戏"],
-    )
-
-    workflow = project.setdefault("voice_workflow", {})
-    workflow.setdefault(
-        "publish_mode",
-        "elevenlabs-web-first" if voice_language.lower().startswith("zh") else "elevenlabs-api-first",
-    )
-    workflow.setdefault("web_manifest", "voice_jobs/web_tts_manifest.json")
-    workflow.setdefault("accent_review_required", True)
-
-    voice_profile = project.setdefault("voice_profile", {})
-    voice_profile.setdefault("provider", "")
-    voice_profile.setdefault("mode", "")
-    voice_profile.setdefault("voice_name", "")
-    voice_profile.setdefault("voice_id", "")
-    voice_profile.setdefault("locale", "")
-    voice_profile.setdefault("source_type", "")
-    voice_profile.setdefault("review_status", "unreviewed")
-    voice_profile.setdefault("review_notes", [])
-
-    voice_persona = project.setdefault("voice_persona", {})
-    voice_persona.setdefault("id", "cn_female_steady_graceful_cute_v1")
-    voice_persona.setdefault("display_name", "沉稳大方可爱女声")
-    voice_persona.setdefault("identity", "熟悉 AI 和工具工作流、表达克制但友好的年轻中文女生")
-    voice_persona.setdefault("core_traits", ["沉稳", "大方", "亲和", "轻微可爱"])
-    voice_persona.setdefault("forbidden_traits", ["幼态", "撒娇", "夹子音", "播音腔", "突然兴奋"])
-    voice_persona.setdefault("baseline_emotion", "calm_friendly")
-    voice_persona.setdefault("pace", "medium_steady")
-    voice_persona.setdefault("breath", "light_short_controlled")
-    voice_persona.setdefault("emphasis", "light_keyword_only")
-    voice_persona.setdefault("qwen_base_instruct", LOCAL_QWEN_BASE_INSTRUCT)
-
-    voice_consistency = project.setdefault("voice_consistency", {})
-    voice_consistency.setdefault("anchor_segment_id", "01")
-    voice_consistency.setdefault(
-        "locked_fields",
-        ["profile", "speaker", "language", "voice_id", "model_id", "base_instruct"],
-    )
-    voice_consistency.setdefault("emotion_variance", "low")
-    voice_consistency.setdefault("pace_variance", "low")
-    voice_consistency.setdefault("breath_variance", "low")
-    voice_consistency.setdefault("regen_policy", "regen_outliers_only")
-
-    acceptance = project.setdefault("acceptance", {})
-    acceptance.setdefault("reviewer", "acceptance-reviewer")
-    acceptance.setdefault("must_pass", ["content_depth", "ui_supports_content", "voice_consistency"])
-    acceptance.setdefault("fail_action", "route_back_to_owner_and_regen")
-    acceptance.setdefault("write_back", "summarize_reusable_findings_into_skill")
-
-    settings = project.setdefault("voice_settings", {})
-    elevenlabs = settings.setdefault("elevenlabs", {})
-    current_voice_id = str(elevenlabs.get("voice_id") or "")
-    if current_voice_id == OLD_DEFAULT_ELEVENLABS_VOICE_ID and voice_profile.get("review_status") != "passed":
-        current_voice_id = ""
-    elevenlabs["voice_id"] = current_voice_id
-    elevenlabs.setdefault("voice_name", "")
-    elevenlabs.setdefault("model_id", "eleven_multilingual_v2")
-    elevenlabs.setdefault("output_format", "mp3_44100_128")
-    elevenlabs.setdefault("stability", 0.72)
-    elevenlabs.setdefault("similarity_boost", 0.8)
-    elevenlabs.setdefault("style", 0.05)
-    elevenlabs.setdefault("use_speaker_boost", True)
-    elevenlabs.setdefault("language_code", "zh")
-
-    edge = settings.setdefault("edge_preview", {})
-    edge.setdefault("voice", "zh-CN-XiaoxiaoNeural")
-    edge.setdefault("rate", "+2%")
-    edge.setdefault("pitch", "+0Hz")
-
-    local_qwen = settings.setdefault("local_qwen", {})
-    local_qwen.setdefault("enabled", True)
-    local_qwen.setdefault("profile", "young_calm_cn_female_explainer")
-    local_qwen.setdefault("speaker", "serena")
-    local_qwen.setdefault("language", "Chinese")
-    if str(local_qwen.get("instruct") or "") == LOCAL_QWEN_BASE_INSTRUCT:
-        local_qwen["instruct"] = DEFAULT_PROJECT_QWEN_INSTRUCT
-    local_qwen.setdefault("instruct", DEFAULT_PROJECT_QWEN_INSTRUCT)
-    local_qwen.setdefault(
-        "model_dir",
-        r"C:\Users\Clr\Desktop\Video Maker\TTS\qwen3-tts-1.7b\models\Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    )
-    local_qwen.setdefault(
-        "helper_script",
-        r"C:\Users\Clr\Desktop\Video Maker\TTS\qwen3-tts-1.7b\scripts\generate_segments_qwen3.py",
-    )
-    local_qwen.setdefault(
-        "python_executable",
-        r"C:\Users\Clr\Desktop\Video Maker\TTS\qwen3-tts-1.7b\.venv\Scripts\python.exe",
-    )
-    local_qwen.setdefault("format", "wav")
-    local_qwen.setdefault("attn_implementation", "sdpa")
-    local_qwen.setdefault("dtype", "bfloat16")
-
-    path.write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+def remove_if_exists(path: Path) -> None:
+    if path.exists():
+        path.unlink()
 
 
 def patch_publish_notes(path: Path) -> None:
     if not path.exists():
         return
-    content = path.read_text(encoding="utf-8")
+    content = path.read_text(encoding="utf-8-sig")
     if PUBLISH_NOTES_MARKER.strip() in content:
         return
     content = content.rstrip() + "\n" + PUBLISH_NOTES_MARKER
     path.write_text(content, encoding="utf-8")
 
 
-def patch_segments_json(path: Path) -> None:
+def read_style_foundation_asset(name: str) -> str:
+    return (STYLE_FOUNDATION_DIR / name).read_text(encoding="utf-8-sig")
+
+
+def neutral_scene_html(topic: str, beat_id: str) -> str:
+    return dedent(
+        f"""
+        <!doctype html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="utf-8">
+          <link rel="stylesheet" href="base.css">
+          <title>{topic}</title>
+        </head>
+        <body>
+          <main class="scene-root" data-scene-id="{beat_id}" data-topic="{topic}"></main>
+        </body>
+        </html>
+        """
+    ).strip() + "\n"
+
+
+def looks_like_legacy_base_css(content: str) -> bool:
+    markers = ["--accent: #d0f810", ".window {", ".glass-panel", ".pill-row"]
+    return all(marker in content for marker in markers)
+
+
+def looks_like_legacy_scene_html(content: str) -> bool:
+    return any(marker in content for marker in LEGACY_SCENE_MARKERS)
+
+
+def sync_visual_foundation(root: Path, topic: str) -> None:
+    slides_dir = root / "slides"
+    slides_dir.mkdir(parents=True, exist_ok=True)
+
+    base_css_path = slides_dir / "base.css"
+    if not base_css_path.exists():
+        write_text(base_css_path, read_style_foundation_asset("base.css"))
+    else:
+        current_base_css = base_css_path.read_text(encoding="utf-8-sig")
+        if looks_like_legacy_base_css(current_base_css):
+            write_text(base_css_path, read_style_foundation_asset("base.css"))
+
+    for html_path in sorted(slides_dir.glob("*.html")):
+        content = html_path.read_text(encoding="utf-8-sig")
+        if not looks_like_legacy_scene_html(content):
+            continue
+        beat_id = html_path.stem
+        write_text(html_path, neutral_scene_html(topic, beat_id))
+
+
+def default_scene_prompt_basis(beat_id: str) -> dict:
+    return {
+        "style_contract": "content/style_contract.json",
+        "shot_intent": f"content/shot_intents.json#{beat_id}",
+        "content_contracts": [
+            f"content/outline_plan.json#{beat_id}",
+            f"content/depth_contract.json#{beat_id}",
+            f"content/detail_weave.json#{beat_id}",
+        ],
+    }
+
+
+def patch_segments_json(root: Path) -> None:
+    path = root / "content" / "segments.json"
     if not path.exists():
         return
-    segments = json.loads(path.read_text(encoding="utf-8"))
+    segments = json.loads(path.read_text(encoding="utf-8-sig"))
     changed = False
-    for item in segments:
-        if item.get("type") == "demo" and not item.get("placeholder_html"):
-            item["placeholder_html"] = "slides/06-demo.html"
+    total = len(segments)
+    for index, item in enumerate(segments, start=1):
+        beat_id = str(item.get("id") or f"scene-{index:03d}")
+        if item.get("id") != beat_id:
+            item["id"] = beat_id
             changed = True
+        if item.get("type") == "demo" and not item.get("placeholder_html") and item.get("html"):
+            item["placeholder_html"] = item["html"]
+            changed = True
+        shot_role = str(item.get("shot_role") or "").strip()
+        if not shot_role:
+            item["shot_role"] = default_shot_role_for_index(index, total)
+            changed = True
+        shot_intent_ref = f"content/shot_intents.json#{beat_id}"
+        if item.get("shot_intent_ref") != shot_intent_ref:
+            item["shot_intent_ref"] = shot_intent_ref
+            changed = True
+        basis = item.get("scene_prompt_basis")
+        if not isinstance(basis, dict):
+            item["scene_prompt_basis"] = default_scene_prompt_basis(beat_id)
+            changed = True
+        else:
+            if basis.get("style_contract") != "content/style_contract.json":
+                basis["style_contract"] = "content/style_contract.json"
+                changed = True
+            if basis.get("shot_intent") != shot_intent_ref:
+                basis["shot_intent"] = shot_intent_ref
+                changed = True
+            content_contracts = basis.get("content_contracts")
+            if not isinstance(content_contracts, list) or len(content_contracts) < 3:
+                basis["content_contracts"] = default_scene_prompt_basis(beat_id)["content_contracts"]
+                changed = True
     if changed:
         path.write_text(json.dumps(segments, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def make_depth_beat(outline_beat: dict) -> dict:
+    beat_id = str(outline_beat.get("beat_id") or "scene-001")
+    provisional_claim = str(outline_beat.get("provisional_claim") or "待由 outline-researcher 提供")
+    return {
+        "beat_id": beat_id,
+        "provisional_claim": provisional_claim,
+        "resolved_claim": "待由 depth-builder 锁定",
+        "claim_job": "define",
+        "beat_progression": "待定义：这一拍相对前后内容推进了什么。",
+        "context_role": str(outline_beat.get("context_role") or "待定义：这一拍与前后内容的关系。"),
+        "misconception_to_break": str(outline_beat.get("confusion_target") or "待定义"),
+        "overclaim_boundary": "待定义：这一拍不能说过头的地方。",
+        "required_support": [],
+        "detail_budget": "standard",
+        "status": "ready_for_detail",
+    }
+
+
+def make_detail_beat(depth_beat: dict) -> dict:
+    beat_id = str(depth_beat.get("beat_id") or "scene-001")
+    return {
+        "beat_id": beat_id,
+        "resolved_claim_ref": f"{beat_id}.claim",
+        "required_support_refs": [],
+        "detail_budget": {
+            "default_max": 2,
+            "expanded_max": 3,
+            "expansion_reason": "depth-red-flag|none",
+        },
+        "details": [],
+        "deferred_details": [],
+        "risk_flags": [],
+    }
+
+
+def make_narration_polish_beat(detail_beat: dict) -> dict:
+    beat_id = str(detail_beat.get("beat_id") or "scene-001")
+    return {
+        "beat_id": beat_id,
+        "spoken_goal": "待由 narration-polisher 把这一拍改写成自然、可口播的中文旁白。",
+        "draft_narration": "待由 narration-polisher 产出 2-5 句旁白，优先修正逻辑连接、语法和翻译腔。",
+        "logic_guardrail": "不要改 resolved_claim，只修正因果链、主语指代、句子连接和人机味。",
+        "grammar_watchouts": [],
+        "humanity_adjustments": ["减少翻译腔", "避免空泛口号", "避免过度书面语"],
+        "locked_terms": [],
+    }
+
+
+def sync_content_artifacts(root: Path) -> None:
+    project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8-sig"))
+    topic = str(project.get("topic") or root.name)
+
+    outline_path = root / "content" / "outline_plan.json"
+    outline_changed = not outline_path.exists()
+    outline = build_outline_plan_data(topic) if outline_changed else json.loads(outline_path.read_text(encoding="utf-8-sig"))
+    outline.setdefault("version", "v3")
+    outline.setdefault("topic", topic)
+    outline.setdefault("outline_status", "needs_outline")
+    outline.setdefault("next_owner", "outline-researcher")
+    if "episode_scope" not in outline:
+        outline["episode_scope"] = outline.pop("higher_order_takeaway", "待定义：这期需要覆盖到什么范围、边界或重点。")
+        outline_changed = True
+    else:
+        outline.pop("higher_order_takeaway", None)
+    outline.setdefault("story_shape", "to-be-decided")
+    outline.setdefault("pacing_strategy", "to-be-decided")
+    coverage_contract = outline.setdefault("coverage_contract", {})
+    if "must_answer" not in coverage_contract or coverage_contract.get("must_answer") == LEGACY_MUST_ANSWER:
+        coverage_contract["must_answer"] = []
+        outline_changed = True
+    if coverage_contract.get("question_policy") != "content-decides":
+        coverage_contract["question_policy"] = "content-decides"
+        outline_changed = True
+    coverage_contract.setdefault("what_not_to_overclaim", [])
+    outline.setdefault("open_questions", [])
+    beats = outline.setdefault("beats", [])
+    if not beats:
+        outline["beats"] = build_outline_plan_data(topic)["beats"]
+        beats = outline["beats"]
+        outline_changed = True
+    for index, beat in enumerate(beats, start=1):
+        beat.setdefault("beat_id", f"scene-{index:03d}")
+        beat.setdefault("order", index)
+        if "provisional_claim" not in beat:
+            beat["provisional_claim"] = beat.pop("key_claim", "待由 outline-researcher 提供")
+            outline_changed = True
+        beat.setdefault("purpose", "placeholder")
+        beat.setdefault("viewer_question", "待补充")
+        if "context_role" not in beat:
+            beat["context_role"] = beat.pop("why_now_role", "to-be-defined")
+            outline_changed = True
+        else:
+            beat.pop("why_now_role", None)
+        beat.setdefault("confusion_target", "to-be-defined")
+        beat.setdefault("visual_focus", "待生成")
+        beat.setdefault("bridge_out", "待生成")
+        beat.setdefault("depth_need", "standard")
+    if outline_changed:
+        outline_path.write_text(json.dumps(outline, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    depth_path = root / "content" / "depth_contract.json"
+    depth_changed = not depth_path.exists()
+    depth = build_depth_contract_data(topic) if depth_changed else json.loads(depth_path.read_text(encoding="utf-8-sig"))
+    depth.setdefault("version", "v1")
+    depth.setdefault("topic", topic)
+    depth.setdefault("status", "needs_depth")
+    depth.setdefault("next_owner", "depth-builder")
+    depth.setdefault("based_on_outline", "content/outline_plan.json")
+    episode_depth_goal = depth.setdefault("episode_depth_goal", {})
+    if "context_note" not in episode_depth_goal:
+        episode_depth_goal["context_note"] = episode_depth_goal.pop("why_now", "待定义：这期与上下文、背景或使用场景的关系。")
+        depth_changed = True
+    else:
+        episode_depth_goal.pop("why_now", None)
+    episode_depth_goal.setdefault("confusion_knot", "待定义：这期最容易长期讲混的核心结在哪里。")
+    if "resolution_note" not in episode_depth_goal:
+        episode_depth_goal["resolution_note"] = episode_depth_goal.pop("judgment_rule", "待定义：这期最终要收束到什么理解或结论。")
+        depth_changed = True
+    else:
+        episode_depth_goal.pop("judgment_rule", None)
+    routing = depth.setdefault("routing", {})
+    routing.setdefault("needs_outline_rework", [])
+    routing.setdefault("ready_for_detail", [])
+    depth_beats = depth.setdefault("beats", [])
+    if not depth_beats or len(depth_beats) != len(outline["beats"]):
+        depth["beats"] = [make_depth_beat(beat) for beat in outline["beats"]]
+        depth_beats = depth["beats"]
+        routing["ready_for_detail"] = [beat["beat_id"] for beat in depth_beats]
+        depth_changed = True
+    for outline_beat, depth_beat in zip(outline["beats"], depth_beats, strict=False):
+        depth_beat.setdefault("beat_id", str(outline_beat.get("beat_id") or "scene-001"))
+        depth_beat.setdefault("provisional_claim", str(outline_beat.get("provisional_claim") or "待由 outline-researcher 提供"))
+        depth_beat.setdefault("resolved_claim", "待由 depth-builder 锁定")
+        depth_beat.setdefault("claim_job", "define")
+        if "beat_progression" not in depth_beat:
+            depth_beat["beat_progression"] = depth_beat.pop("judgment_shift", "待定义：这一拍相对前后内容推进了什么。")
+            depth_changed = True
+        else:
+            depth_beat.pop("judgment_shift", None)
+        if "context_role" not in depth_beat:
+            depth_beat["context_role"] = depth_beat.pop(
+                "why_now_role",
+                str(outline_beat.get("context_role") or "待定义：这一拍与前后内容的关系。"),
+            )
+            depth_changed = True
+        else:
+            depth_beat.pop("why_now_role", None)
+        depth_beat.setdefault("misconception_to_break", str(outline_beat.get("confusion_target") or "待定义"))
+        depth_beat.setdefault("overclaim_boundary", "待定义：这一拍不能说过头的地方。")
+        depth_beat.setdefault("required_support", [])
+        depth_beat.setdefault("detail_budget", "standard")
+        depth_beat.setdefault("status", "ready_for_detail")
+    if depth_changed:
+        depth_path.write_text(json.dumps(depth, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    detail_path = root / "content" / "detail_weave.json"
+    detail_changed = not detail_path.exists()
+    detail = build_detail_weave_data() if detail_changed else json.loads(detail_path.read_text(encoding="utf-8-sig"))
+    detail.setdefault("version", "v1")
+    detail.setdefault("detail_status", "needs_detail")
+    detail.setdefault("next_owner", "detail-filler")
+    source_contracts = detail.setdefault("source_contracts", {})
+    source_contracts.setdefault("outline_plan", "content/outline_plan.json")
+    source_contracts.setdefault("depth_contract", "content/depth_contract.json")
+    locks = detail.setdefault("locks", {})
+    locks.setdefault("coverage_shape_locked", True)
+    locks.setdefault("beat_order_locked", True)
+    locks.setdefault("claims_locked", True)
+    detail_beats = detail.setdefault("beats", [])
+    if not detail_beats or len(detail_beats) != len(depth["beats"]):
+        detail["beats"] = [make_detail_beat(beat) for beat in depth["beats"]]
+        detail_beats = detail["beats"]
+        detail_changed = True
+    for depth_beat, detail_beat in zip(depth["beats"], detail_beats, strict=False):
+        beat_id = str(depth_beat.get("beat_id") or "scene-001")
+        detail_beat.setdefault("beat_id", beat_id)
+        detail_beat.setdefault("resolved_claim_ref", f"{beat_id}.claim")
+        detail_beat.setdefault("required_support_refs", [])
+        detail_budget = detail_beat.setdefault("detail_budget", {})
+        detail_budget.setdefault("default_max", 2)
+        detail_budget.setdefault("expanded_max", 3)
+        detail_budget.setdefault("expansion_reason", "depth-red-flag|none")
+        detail_beat.setdefault("details", [])
+        detail_beat.setdefault("deferred_details", [])
+        detail_beat.setdefault("risk_flags", [])
+    detail.setdefault("sources", [])
+    detail.setdefault("deferred_details", [])
+    if detail_changed:
+        detail_path.write_text(json.dumps(detail, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    narration_path = root / "content" / "narration_polish.json"
+    narration_changed = not narration_path.exists()
+    narration_polish = (
+        build_narration_polish_data()
+        if narration_changed
+        else json.loads(narration_path.read_text(encoding="utf-8-sig"))
+    )
+    narration_polish.setdefault("version", "v1")
+    narration_polish.setdefault("status", "needs_narration_polish")
+    narration_polish.setdefault("next_owner", "narration-polisher")
+    narration_sources = narration_polish.setdefault("source_contracts", {})
+    narration_sources.setdefault("outline_plan", "content/outline_plan.json")
+    narration_sources.setdefault("depth_contract", "content/depth_contract.json")
+    narration_sources.setdefault("detail_weave", "content/detail_weave.json")
+    narration_constraints = narration_polish.setdefault("constraints", {})
+    narration_constraints.setdefault("beat_order_locked", True)
+    narration_constraints.setdefault("resolved_claim_locked", True)
+    narration_constraints.setdefault("no_new_facts_without_source", True)
+    narration_constraints.setdefault("spoken_chinese_required", True)
+    narration_beats = narration_polish.setdefault("beats", [])
+    if not narration_beats or len(narration_beats) != len(detail["beats"]):
+        narration_polish["beats"] = [make_narration_polish_beat(beat) for beat in detail["beats"]]
+        narration_beats = narration_polish["beats"]
+        narration_changed = True
+    for detail_beat, narration_beat in zip(detail["beats"], narration_beats, strict=False):
+        beat_id = str(detail_beat.get("beat_id") or "scene-001")
+        narration_beat.setdefault("beat_id", beat_id)
+        narration_beat.setdefault("spoken_goal", "待由 narration-polisher 把这一拍改写成自然、可口播的中文旁白。")
+        narration_beat.setdefault("draft_narration", "待由 narration-polisher 产出 2-5 句旁白，优先修正逻辑连接、语法和翻译腔。")
+        narration_beat.setdefault("logic_guardrail", "不要改 resolved_claim，只修正因果链、主语指代、句子连接和人机味。")
+        narration_beat.setdefault("grammar_watchouts", [])
+        narration_beat.setdefault("humanity_adjustments", ["减少翻译腔", "避免空泛口号", "避免过度书面语"])
+        narration_beat.setdefault("locked_terms", [])
+    narration_polish.setdefault(
+        "global_avoid",
+        ["营销腔", "为了显得聪明而堆术语", "一句里塞太多转折", "像模型解释模型一样的自我指涉"],
+    )
+    if narration_changed:
+        narration_path.write_text(json.dumps(narration_polish, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    style_contract_path = root / "content" / "style_contract.json"
+    style_contract_changed = not style_contract_path.exists()
+    style_contract = (
+        build_style_contract_data()
+        if style_contract_changed
+        else json.loads(style_contract_path.read_text(encoding="utf-8-sig"))
+    )
+    default_style_contract = build_style_contract_data()
+    for key, value in default_style_contract.items():
+        if key not in style_contract:
+            style_contract[key] = value
+            style_contract_changed = True
+    if style_contract_changed:
+        style_contract_path.write_text(json.dumps(style_contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    shot_intents_path = root / "content" / "shot_intents.json"
+    shot_intents_changed = not shot_intents_path.exists()
+    shot_intents = (
+        build_shot_intents_data(topic)
+        if shot_intents_changed
+        else json.loads(shot_intents_path.read_text(encoding="utf-8-sig"))
+    )
+    for key, value in {
+        "version": "v1",
+        "topic": topic,
+        "status": "needs_shot_intents",
+        "next_owner": "chief-editor",
+        "style_contract_ref": "content/style_contract.json",
+    }.items():
+        if key not in shot_intents:
+            shot_intents[key] = value
+            shot_intents_changed = True
+    intent_beats = shot_intents.get("beats")
+    if not isinstance(intent_beats, list):
+        shot_intents["beats"] = []
+        intent_beats = shot_intents["beats"]
+        shot_intents_changed = True
+    if not intent_beats or len(intent_beats) != len(outline["beats"]):
+        intent_beats = []
+        total = len(outline["beats"])
+        for index, outline_beat in enumerate(outline["beats"], start=1):
+            beat_id = str(outline_beat.get("beat_id") or f"scene-{index:03d}")
+            intent_beats.append(
+                {
+                    "beat_id": beat_id,
+                    "shot_role": str(outline_beat.get("shot_role_hint") or default_shot_role_for_index(index, total)),
+                    "narrative_job": str(outline_beat.get("purpose") or "待由 chief-editor 补齐这一拍的叙事职责。"),
+                    "visual_goal": str(outline_beat.get("visual_focus") or "待定义这一拍的主视觉焦点。"),
+                    "must_show": ["本页唯一关键结论"],
+                    "must_avoid": ["固定模板复用", "无关 glass 摆件"],
+                    "chrome_level": "minimal",
+                    "motion_source": "from-primary-focus",
+                    "scene_prompt_stub": "先锁这一拍的主结论，再决定需要哪种构图和少量功能层。",
+                }
+            )
+        shot_intents["beats"] = intent_beats
+        shot_intents_changed = True
+    total = len(intent_beats)
+    for index, (outline_beat, intent_beat) in enumerate(zip(outline["beats"], intent_beats, strict=False), start=1):
+        beat_id = str(outline_beat.get("beat_id") or f"scene-{index:03d}")
+        defaults = {
+            "beat_id": beat_id,
+            "shot_role": str(outline_beat.get("shot_role_hint") or default_shot_role_for_index(index, total)),
+            "narrative_job": str(outline_beat.get("purpose") or "待由 chief-editor 补齐这一拍的叙事职责。"),
+            "visual_goal": str(outline_beat.get("visual_focus") or "待定义这一拍的主视觉焦点。"),
+            "must_show": ["本页唯一关键结论"],
+            "must_avoid": ["固定模板复用", "无关 glass 摆件"],
+            "chrome_level": "minimal",
+            "motion_source": "from-primary-focus",
+            "scene_prompt_stub": "先锁这一拍的主结论，再决定需要哪种构图和少量功能层。",
+        }
+        for key, value in defaults.items():
+            if key not in intent_beat:
+                intent_beat[key] = value
+                shot_intents_changed = True
+    if shot_intents_changed:
+        shot_intents_path.write_text(json.dumps(shot_intents, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+PROJECT_RUNTIME_COMMON = dedent(
+    r"""
+    from __future__ import annotations
+
+    import json
+    import os
+    import re
+    from pathlib import Path
+
+
+    AUDIO_EXTENSIONS = (".wav", ".mp3")
+    SPOKEN_TEXT_KEYS = ("tts_text", "spoken_text", "voice_spoken", "narration_text", "voice")
+
+
+    def load_project(root: Path) -> tuple[dict, list[dict]]:
+        project = json.loads((root / "content" / "project.json").read_text(encoding="utf-8-sig"))
+        segments = json.loads((root / "content" / "segments.json").read_text(encoding="utf-8-sig"))
+        return project, segments
+
+
+    def target_language(project: dict) -> str:
+        return str(project.get("voice_language") or "zh-CN")
+
+
+    def is_chinese_target(project: dict) -> bool:
+        return target_language(project).lower().startswith("zh")
+
+
+    def local_qwen_config(project: dict) -> dict:
+        return ((project.get("voice_settings") or {}).get("local_qwen") or {})
+
+
+    def local_qwen_ready(project: dict) -> bool:
+        cfg = local_qwen_config(project)
+        if not bool(cfg.get("enabled", False)):
+            return False
+        python_executable = Path(str(cfg.get("python_executable") or ""))
+        model_dir = Path(str(cfg.get("model_dir") or ""))
+        return python_executable.exists() and model_dir.exists()
+
+
+    def narration_mode(project: dict) -> str:
+        workflow = project.get("voice_workflow", {}) or {}
+        return str(workflow.get("narration_mode") or "master-track-preferred")
+
+
+    def audio_candidates(root: Path, seg_id: str) -> list[Path]:
+        return [root / "audio" / f"{seg_id}{ext}" for ext in AUDIO_EXTENSIONS]
+
+
+    def find_existing_audio(root: Path, seg_id: str) -> Path | None:
+        for candidate in audio_candidates(root, seg_id):
+            if candidate.exists():
+                return candidate
+        return None
+
+
+    def find_existing_master_audio(root: Path) -> Path | None:
+        for name in ("master.wav", "master.mp3"):
+            candidate = root / "audio" / name
+            if candidate.exists():
+                return candidate
+        return None
+
+
+    def normalize_narration_text(text: str, language: str = "zh-CN") -> str:
+        cleaned = str(text or "")
+        if not cleaned:
+            return ""
+        cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+        cleaned = cleaned.replace("\u3000", " ").replace("\xa0", " ")
+        cleaned = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", cleaned)
+        cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+        cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
+        cleaned = re.sub(r"(?m)^\s{0,3}(?:[-*•]|\d+\.)\s+", "", cleaned)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = re.sub(r"\.\.\.+", "……", cleaned)
+        cleaned = re.sub(r"([。！？；，、,.!?;:])\1+", r"\1", cleaned)
+        cleaned = re.sub(r"\s+\n", "\n", cleaned)
+        cleaned = re.sub(r"\n\s+", "\n", cleaned)
+        if language.lower().startswith("zh"):
+            cleaned = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", cleaned)
+            cleaned = re.sub(r"\s+(?=[，。！？；：、])", "", cleaned)
+            cleaned = re.sub(r"(?<=[（《“])\s+", "", cleaned)
+        return cleaned.strip()
+
+
+    def segment_narration_text(segment: dict, project: dict | None = None) -> str:
+        for key in SPOKEN_TEXT_KEYS:
+            value = str(segment.get(key) or "").strip()
+            if value:
+                language = target_language(project or {}) if project else "zh-CN"
+                return normalize_narration_text(value, language=language)
+        return ""
+
+
+    def join_voice_blocks(segments: list[dict], project: dict | None = None) -> str:
+        parts = [segment_narration_text(item, project) for item in segments]
+        return "\n\n".join(part for part in parts if part)
+    """
+).strip() + "\n"
+
+
+GENERATE_TTS_PUBLISH = dedent(
+    r"""
+    from __future__ import annotations
+
+    import argparse
+    import asyncio
+    import subprocess
+    from pathlib import Path
+
+    from video_pipeline_common import (
+        load_project,
+        local_qwen_ready,
+    )
+
+
+    def parse_args() -> argparse.Namespace:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--root", required=True)
+        parser.add_argument(
+            "--provider",
+            default="auto",
+            choices=["auto", "local-qwen", "edge-preview"],
+        )
+        parser.add_argument("--force", action="store_true")
+        return parser.parse_args()
+
+
+    def choose_provider(root: Path, project: dict, segments: list[dict], requested: str) -> str:
+        if requested != "auto":
+            return requested
+        if local_qwen_ready(project):
+            return "local-qwen"
+        return "edge-preview"
+
+
+    def run_local_qwen(root: Path, force: bool) -> None:
+        cmd = ["python", str(root / "scripts" / "generate_tts_local_qwen.py"), "--root", str(root)]
+        if force:
+            cmd.append("--force")
+        subprocess.run(cmd, check=True)
+
+
+    def run_edge_preview(root: Path, force: bool) -> None:
+        cmd = ["python", str(root / "scripts" / "generate_tts_edge.py"), "--root", str(root)]
+        if force:
+            cmd.append("--force")
+        subprocess.run(cmd, check=True)
+
+
+    async def main() -> None:
+        args = parse_args()
+        root = Path(args.root).resolve()
+        project, segments = load_project(root)
+        provider = choose_provider(root, project, segments, args.provider)
+
+        if provider == "local-qwen":
+            print("[tts] provider=local-qwen")
+            run_local_qwen(root, args.force)
+            return
+
+        print("[tts] provider=edge-preview")
+        run_edge_preview(root, args.force)
+
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+    """
+).strip() + "\n"
+
+
+PREPARE_WEB_TTS_MANIFEST = dedent(
+    r"""
+    from __future__ import annotations
+
+    import argparse
+    from pathlib import Path
+
+    def parse_args() -> argparse.Namespace:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--root", required=True)
+        return parser.parse_args()
+
+
+    def main() -> None:
+        args = parse_args()
+        root = Path(args.root).resolve()
+        raise RuntimeError(
+            "prepare_web_tts_manifest.py has been removed from video-maker. "
+            "This skill now uses local Qwen 12Hz or Edge preview only."
+        )
+
+
+    if __name__ == "__main__":
+        main()
+    """
+).strip() + "\n"
+
+
+GENERATE_TTS_EDGE = dedent(
+    r"""
+    from __future__ import annotations
+
+    import argparse
+    import asyncio
+    from pathlib import Path
+
+    import edge_tts
+
+    from video_pipeline_common import join_voice_blocks, load_project
+
+
+    def parse_args() -> argparse.Namespace:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--root", required=True)
+        parser.add_argument("--force", action="store_true")
+        return parser.parse_args()
+
+
+    async def synthesize(text: str, out_path: Path, voice: str, rate: str, pitch: str) -> None:
+        communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
+        await communicate.save(str(out_path))
+
+
+    async def main() -> None:
+        args = parse_args()
+        root = Path(args.root).resolve()
+        project, segments = load_project(root)
+        edge_cfg = ((project.get("voice_settings") or {}).get("edge_preview") or {})
+        voice = str(edge_cfg.get("voice") or "zh-CN-XiaoxiaoNeural")
+        rate = str(edge_cfg.get("rate") or "+2%")
+        pitch = str(edge_cfg.get("pitch") or "+0Hz")
+
+        out_dir = root / "audio"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        out_path = out_dir / "master.mp3"
+        if out_path.exists() and not args.force:
+            print(f"[skip] {out_path}")
+            return
+        text = join_voice_blocks(segments, project)
+        await synthesize(text, out_path, voice, rate, pitch)
+        print(f"[ok] {out_path}")
+
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+    """
+).strip() + "\n"
+
+
+QUICK_CHECK = dedent(
+    r"""
+    from __future__ import annotations
+
+    import argparse
+    import json
+    import sys
+    from pathlib import Path
+
+    from video_pipeline_common import (
+        find_existing_master_audio,
+        load_project,
+    )
+
+
+    def parse_args() -> argparse.Namespace:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--root", required=True)
+        parser.add_argument("--strict", action="store_true")
+        return parser.parse_args()
+
+
+    def main() -> None:
+        args = parse_args()
+        root = Path(args.root).resolve()
+        hard_failures: list[str] = []
+        warnings: list[str] = []
+
+        project_path = root / "content" / "project.json"
+        segments_path = root / "content" / "segments.json"
+        notes_path = root / "publish_notes.md"
+        outline_path = root / "content" / "outline_plan.json"
+        depth_path = root / "content" / "depth_contract.json"
+        detail_path = root / "content" / "detail_weave.json"
+        style_contract_path = root / "content" / "style_contract.json"
+        shot_intents_path = root / "content" / "shot_intents.json"
+
+        for required in [
+            project_path,
+            segments_path,
+            notes_path,
+            outline_path,
+            depth_path,
+            detail_path,
+            style_contract_path,
+            shot_intents_path,
+        ]:
+            if not required.exists():
+                hard_failures.append(f"missing required file: {required}")
+
+        if hard_failures:
+            for item in hard_failures:
+                print(f"[FAIL] {item}")
+            sys.exit(1)
+
+        project, segments = load_project(root)
+        shot_intents = json.loads(shot_intents_path.read_text(encoding="utf-8-sig"))
+        style_contract = json.loads(style_contract_path.read_text(encoding="utf-8-sig"))
+
+        if not segments:
+            hard_failures.append("segments.json is empty; generate a beat-driven scene list before rendering")
+        if str(style_contract.get("prompt_mode") or "") != "style-not-template":
+            warnings.append("style_contract.json 没有明确声明 style-not-template；可能会重新滑回固定模板思路。")
+
+        provider = str(project.get("voice_provider", "local-qwen"))
+        voice_language = str(project.get("voice_language", "zh-CN")).lower()
+        workflow = project.get("voice_workflow", {}) or {}
+        voice_profile = project.get("voice_profile", {}) or {}
+        local_qwen = ((project.get("voice_settings") or {}).get("local_qwen") or {})
+        local_qwen_enabled = bool(local_qwen.get("enabled", False))
+        local_qwen_python = Path(str(local_qwen.get("python_executable") or "")) if local_qwen else Path()
+        local_qwen_model_dir = Path(str(local_qwen.get("model_dir") or "")) if local_qwen else Path()
+        local_qwen_ready = local_qwen_enabled and local_qwen_python.exists() and local_qwen_model_dir.exists()
+
+        if provider in {"preview-edge-tts", "edge-tts"}:
+            warnings.append("voice_provider 仍是预览级 TTS，适合粗剪，不建议直接发布。")
+        elif provider == "local-qwen" and local_qwen_enabled and not local_qwen_ready:
+            warnings.append("voice_settings.local_qwen 已启用，但本地 Qwen 12Hz Python 或 model_dir 路径不存在。")
+
+        if voice_language.startswith("zh") and workflow.get("accent_review_required", True):
+            if provider != "local-qwen" and str(voice_profile.get("review_status", "unreviewed")).lower() != "passed":
+                warnings.append("中文终版配音尚未通过听感验收；先确认没有外国人口音或明显翻译腔。")
+
+        voice_locale = str(voice_profile.get("locale", "")).lower()
+        if voice_language.startswith("zh") and voice_locale and not voice_locale.startswith("zh"):
+            warnings.append(f"当前 voice_profile.locale={voice_locale}；中文旁白存在外国人口音风险。")
+
+        for item in segments:
+            if item.get("type") == "slide":
+                html_path = root / item["html"]
+                if not html_path.exists():
+                    hard_failures.append(f"missing slide html: {html_path}")
+            if item.get("type") == "demo":
+                video_path = root / item["video"]
+                if not video_path.exists():
+                    placeholder_html = item.get("placeholder_html") or item.get("html")
+                    if placeholder_html and (root / placeholder_html).exists():
+                        warnings.append(f"segment {item.get('id')} demo 录像缺失；render_all 会先用占位场景 {placeholder_html} 顶上。")
+                    else:
+                        hard_failures.append(f"missing demo video and placeholder: {video_path}")
+            if "待由" in str(item.get("voice") or ""):
+                warnings.append(f"segment {item.get('id')} 仍是占位旁白；先完成 content compile 再出片。")
+            if not str(item.get("shot_role") or "").strip():
+                hard_failures.append(f"segment {item.get('id')} 缺少 shot_role；scene compiler 必须按镜头职责而不是页面模板工作。")
+            if not isinstance(item.get("scene_prompt_basis"), dict):
+                hard_failures.append(f"segment {item.get('id')} 缺少 scene_prompt_basis；无法追溯 style contract -> shot intent -> scene prompt 链路。")
+            elif str((item.get("scene_prompt_basis") or {}).get("style_contract") or "") != "content/style_contract.json":
+                warnings.append(f"segment {item.get('id')} 的 style_contract 引用异常；检查 scene_prompt_basis。")
+
+        intent_beats = shot_intents.get("beats")
+        if not isinstance(intent_beats, list) or not intent_beats:
+            hard_failures.append("shot_intents.json 为空；chief-editor 需要先把 beat 职责翻译成 shot intent。")
+        elif len(intent_beats) != len(segments):
+            warnings.append("shot_intents.json 与 segments.json 数量不一致；可能存在未对齐的镜头职责。")
+
+        if workflow.get("narration_mode") == "master-track-preferred" and not find_existing_master_audio(root):
+            warnings.append("当前项目要求整段 master-track，但还没有生成 master audio。")
+
+        if hard_failures:
+            for item in hard_failures:
+                print(f"[FAIL] {item}")
+            sys.exit(1)
+
+        for item in warnings:
+            print(f"[WARN] {item}")
+
+        print("[OK] project structure looks usable")
+        if warnings and args.strict:
+            sys.exit(2)
+
+
+    if __name__ == "__main__":
+        main()
+    """
+).strip() + "\n"
+
+
+def merge_project_json(path: Path, provider: str) -> None:
+    project = json.loads(path.read_text(encoding="utf-8-sig"))
+    project = apply_project_defaults(project, voice_provider=provider)
+    path.write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def main() -> None:
@@ -1485,22 +2069,28 @@ def main() -> None:
         raise FileNotFoundError(f"Missing project.json at {project_path}")
 
     merge_project_json(project_path, args.voice_provider)
-    patch_segments_json(root / "content" / "segments.json")
+    project = json.loads(project_path.read_text(encoding="utf-8-sig"))
+    sync_visual_foundation(root, str(project.get("topic") or root.name))
+    sync_content_artifacts(root)
+    patch_segments_json(root)
     patch_publish_notes(root / "publish_notes.md")
 
+    write_text(scripts_dir / "video_pipeline_common.py", PROJECT_RUNTIME_COMMON)
     write_text(scripts_dir / "generate_tts_publish.py", GENERATE_TTS_PUBLISH)
-    write_text(scripts_dir / "prepare_web_tts_manifest.py", PREPARE_WEB_TTS_MANIFEST)
     write_text(scripts_dir / "prepare_publish_job.py", PREPARE_PUBLISH_JOB)
     write_text(scripts_dir / "record_voice_profile.py", RECORD_VOICE_PROFILE)
     write_text(scripts_dir / "generate_tts_edge.py", GENERATE_TTS_EDGE)
     write_text(scripts_dir / "generate_tts_local_qwen.py", GENERATE_TTS_LOCAL_QWEN)
     write_text(scripts_dir / "assemble_video.py", ASSEMBLE_VIDEO)
+    write_text(scripts_dir / "render_slides.ps1", RENDER_SLIDES)
     write_text(scripts_dir / "render_all.ps1", RENDER_ALL)
     write_text(scripts_dir / "check_voice_env.ps1", CHECK_VOICE_ENV)
     write_text(scripts_dir / "quick_check.py", QUICK_CHECK)
+    remove_if_exists(scripts_dir / "prepare_web_tts_manifest.py")
 
     print(f"[ok] upgraded project at {root}")
 
 
 if __name__ == "__main__":
     main()
+

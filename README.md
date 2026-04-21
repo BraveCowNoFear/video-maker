@@ -7,14 +7,14 @@
 It is built around one practical goal:
 
 - bootstrap a reusable project
-- write and refine Chinese explainer segments
+- build the content contract before scene generation
 - render slides
 - generate narration with local Qwen3-TTS first
-- fall back to ElevenLabs or Edge when needed
+- fall back to Edge preview when needed
 - assemble a final MP4 locally
 - prepare structured publish metadata for a Bilibili upload worker
 
-The default visual system for new explainers is now `Quiet Glass Lab v3`: a black-carbon, acid-green Liquid Glass layout inspired by iOS 26 / iPadOS 26 and tuned for 3-5 minute Chinese Bilibili tech explainers.
+The default visual system for new explainers is now `Quiet Glass Lab v3`: a black-carbon, acid-green frosted-glass layout tuned for content-first Chinese Bilibili tech explainers.
 
 ## What is in this repo
 
@@ -22,7 +22,7 @@ The default visual system for new explainers is now `Quiet Glass Lab v3`: a blac
 - `scripts/bootstrap_project.py`: self-contained project bootstrap
 - `scripts/bootstrap_video_project.py`: base Bilibili video scaffold generator
 - `scripts/upgrade_project.py`: local-Qwen-first upgrade path plus publish helpers
-- `references/`: voice, workflow, and provider notes
+- `references/`: voice, workflow, and rubric notes
 - `references/agent-orchestration.md`: recommended main-agent / sub-agent content pipeline
 - `references/video-acceptance-rubric.md`: dedicated reviewer-agent gate before final render or publish
 - `references/quiet-glass-lab-v3.md`: content-first Liquid Glass rules and design tokens
@@ -124,17 +124,15 @@ The generated local-Qwen path does not only reuse `voice_settings.local_qwen`; i
 Provider order:
 
 1. `local-qwen`
-2. reviewed `elevenlabs-api`
-3. explicit reviewed `elevenlabs-web`
-4. `edge-preview`
+2. `edge-preview`
 
 ## Content system
 
 The current recommended production split is:
 
-1. main agent as `chief-editor`
-2. sidecar subagents for research, skepticism, UI direction, and voice consistency
-3. main agent merges those results back into one concise thesis, one segment map, and one publishable point of view
+1. `chief-editor` owns the episode contract
+2. content runs in serial `outline -> depth -> detail -> narration-polish`
+3. `chief-editor` compiles `style_contract`, `shot_intents`, and `segments`
 
 The key rule is: a video should not stop at "what this term means." Each episode should also answer why the idea matters now, what confusion it clears up, and what judgment the viewer can carry away after the video ends.
 
@@ -172,7 +170,7 @@ The intended upload pairing is:
 - If the task is local project creation, narration, QA, or video assembly, use `video-maker`
 - If the task crosses into visible Windows UI control, also use `desktop-control-for-windows`
 - For first-run setup or debugging on a new machine, run `scripts/doctor.py` before attempting a full publish pipeline
-- For future Bilibili tech explainers, prefer the default `Quiet Glass Lab v3` templates first and only diverge when the topic truly needs a different visual language
+- For future Bilibili tech explainers, prefer the default `Quiet Glass Lab v3` prompt pack first and only diverge when the topic truly needs a different visual language
 
 ## License
 
