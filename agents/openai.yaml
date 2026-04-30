@@ -1,7 +1,7 @@
 interface:
   display_name: "Video Maker"
-  short_description: "B站视频制作主 skill，优先本地 Qwen；真实上传需配合 desktop-control-for-windows"
-  default_prompt: "Use $video-maker to scaffold or upgrade a B站 video project with local Qwen-first TTS, local rendering, publish metadata generation, and desktop-control-for-windows handoff for real upload."
+  short_description: "B站视频制作主 skill：串行内容研究、本地 Qwen 优先配音、本地渲染、Image Gen 封面与发布 handoff"
+  default_prompt: "Use $video-maker to scaffold or upgrade a B站 video project with serial content orchestration, local Qwen-first TTS, local rendering, Image Gen cover creation, and desktop-control-for-windows handoff for real upload."
 
 policy:
   allow_implicit_invocation: true
